@@ -1368,6 +1368,23 @@ def keep_alive():
 
 # ============================== MAIN ==============================
 
+# --- YANGI QO'SHILGAN FUNKSIYALAR ---
+async def forward_handler(update, context):
+    forward_origin = update.message.forward_origin
+    if forward_origin and forward_origin.type == 'channel':
+        channel_id = forward_origin.chat.id
+        channel_title = forward_origin.chat.title
+        await update.message.reply_text(
+            f"✅ Kanal muvaffaqiyatli tanindi!\n\n📌 Kanal nomi: {channel_title}\n🆔 Kanal ID: `{channel_id}`",
+            parse_mode="Markdown"
+        )
+    else:
+        await update.message.reply_text("❌ Bu xabar kanaldan forward qilinmagan!")
+
+async def unknown_text_handler(update, context):
+    await update.message.reply_text("⚠️ Iltimos, kino qidirish uchun faqat kino KODINI (raqamlarda) yuboring.")
+
+# --- ASOSIY MAIN FUNKSIYASI ---
 def main():
     init_db()
     keep_alive()
@@ -1376,8 +1393,12 @@ def main():
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CallbackQueryHandler(callback_router))
+    
+    # Yangi qatorlar shu yerda
+    app.add_handler(MessageHandler(filters.FORWARDED, forward_handler))
     app.add_handler(MessageHandler(filters.PHOTO | filters.VIDEO | filters.Document.ALL, media_handler))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+    app.add_handler(MessageHandler(filters.Regex(r'^\d+$'), text_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, unknown_text_handler))
 
     print("🤖 Bot ishga tushdi...")
     app.run_polling()
