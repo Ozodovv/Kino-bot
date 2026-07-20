@@ -1370,41 +1370,20 @@ def keep_alive():
 
 # --- YANGI QO'SHILGAN FUNKSIYALAR ---
 async def forward_handler(update, context):
-    chat_id = None
-    chat_title = "Noma'lum"
-    chat_type = "Kanal/Guruh"
-
-    # 1-usul: Odatdagi versiyalar uchun
-    if update.message.forward_from_chat:
-        chat_id = update.message.forward_from_chat.id
-        chat_title = update.message.forward_from_chat.title
-        
-        # Turi guruhmi yoki kanal ekanligini aniqlaymiz
-        if update.message.forward_from_chat.type in ['group', 'supergroup']:
-            chat_type = "Guruh"
-        elif update.message.forward_from_chat.type == 'channel':
-            chat_type = "Kanal"
-            
-    # 2-usul: Yangi Telegram API versiyalari uchun (zaxira)
-    elif update.message.forward_origin and hasattr(update.message.forward_origin, 'chat'):
-        chat_id = update.message.forward_origin.chat.id
-        chat_title = update.message.forward_origin.chat.title
-        
-        if getattr(update.message.forward_origin, 'type', '') == 'channel':
-            chat_type = "Kanal"
-        elif getattr(update.message.forward_origin, 'type', '') == 'chat':
-            chat_type = "Guruh"
-
-    # Natijani chiqarish
-    if chat_id:
+    forward_origin = update.message.forward_origin
+    if forward_origin and forward_origin.type == 'channel':
+        channel_id = forward_origin.chat.id
+        channel_title = forward_origin.chat.title
         await update.message.reply_text(
-            f"✅ {chat_type} muvaffaqiyatli tanindi!\n\n"
-            f"📌 {chat_type} nomi: {chat_title}\n"
-            f"🆔 ID: `{chat_id}`",
+            f"✅ Kanal muvaffaqiyatli tanindi!\n\n📌 Kanal nomi: {channel_title}\n🆔 Kanal ID: `{channel_id}`",
             parse_mode="Markdown"
         )
     else:
-        await update.message.reply_text("❌ Xabar keldi, lekin guruh yoki kanal ma'lumotlari topilmadi! Sozlamalarni tekshiring.")
+        await update.message.reply_text("❌ Bu xabar kanaldan forward qilinmagan!")
+
+async def unknown_text_handler(update, context):
+    await update.message.reply_text("⚠️ Iltimos, kino qidirish uchun faqat kino KODINI (raqamlarda) yuboring.")
+
 # --- ASOSIY MAIN FUNKSIYASI ---
 def main():
     init_db()
