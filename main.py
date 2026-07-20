@@ -19,8 +19,7 @@ ISHGA TUSHIRISH:
 
 import os
 import logging
-import psycopg2
-import psycopg2.extras
+import sqlite3
 import datetime
 from contextlib import closing
 from threading import Thread
@@ -74,19 +73,20 @@ logger = logging.getLogger(__name__)
 # ============================== BAZA (DATABASE) ==============================
 
 import os
-import psycopg2
-import psycopg2.extras
 
 def get_conn():
-    # Railway o'zi beradigan PostgreSQL havolasini olamiz
-    database_url = os.environ.get("DATABASE_URL")
+    # Railway uchun xavfsiz papkani tekshiramiz
+    db_dir = "/app/data"
+    if not os.path.exists(db_dir):
+        os.makedirs(db_dir, exist_ok=True)
+        
+    db_path = os.path.join(db_dir, "baza.db")
     
-    # Bazaga ulanamiz
-    conn = psycopg2.connect(database_url)
-    
-    # SQLite dagi kabi natijalarni nomlari bilan olish uchun:
-    conn.cursor_factory = psycopg2.extras.RealDictCursor
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
     return conn
+
+
 def init_db():
     with closing(get_conn()) as conn, conn:
         conn.executescript(
@@ -97,7 +97,7 @@ def init_db():
                 first_name  TEXT,
                 balance     REAL DEFAULT 0,
                 ref_by      INTEGER,
-                joined _at   TEXT
+                joined_at   TEXT
             );
 
             CREATE TABLE IF NOT EXISTS movies (
