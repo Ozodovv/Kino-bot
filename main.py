@@ -19,7 +19,8 @@ ISHGA TUSHIRISH:
 
 import os
 import logging
-import sqlite3
+import psycopg2
+import psycopg2.extras
 import datetime
 from contextlib import closing
 from threading import Thread
@@ -72,13 +73,20 @@ logger = logging.getLogger(__name__)
 
 # ============================== BAZA (DATABASE) ==============================
 
+import os
+import psycopg2
+import psycopg2.extras
+
 def get_conn():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
+    # Railway o'zi beradigan PostgreSQL havolasini olamiz
+    database_url = os.environ.get("DATABASE_URL")
+    
+    # Bazaga ulanamiz
+    conn = psycopg2.connect(database_url)
+    
+    # SQLite dagi kabi natijalarni nomlari bilan olish uchun:
+    conn.cursor_factory = psycopg2.extras.RealDictCursor
     return conn
-
-
 def init_db():
     with closing(get_conn()) as conn, conn:
         conn.executescript(
@@ -89,7 +97,7 @@ def init_db():
                 first_name  TEXT,
                 balance     REAL DEFAULT 0,
                 ref_by      INTEGER,
-                joined_at   TEXT
+                joined _at   TEXT
             );
 
             CREATE TABLE IF NOT EXISTS movies (
