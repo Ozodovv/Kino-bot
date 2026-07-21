@@ -1658,16 +1658,18 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await process_movie_code(update.message, context, text, user.id)
 
 
-async def finish_or_continue_series(msg, context: ContextTypes.DEFAULT_TYPE):
-    """Kino/serial kanalga joylangandan keyin chaqiriladi.
+async def finish_or_continue_series(msg, context: ContextTypes.DEFAULT_TYPE, posted_to_channel: bool = True):
+    """Kino/serial qismi saqlangandan keyin chaqiriladi.
     Faqat SERIAL bo'lsa ("yana qism qo'shasizmi?" deb so'raydi), oddiy kino bo'lsa
-    darhol tugaydi va hech narsa so'ramaydi."""
+    darhol tugaydi va hech narsa so'ramaydi.
+    posted_to_channel=False bo'lsa — bu safar kanalga xabar YUBORILMAGAN
+    (chunki serialning 1-qismidan boshqasi uchun kanalga qayta post qilinmaydi)."""
     nm = context.user_data.get("new_movie") or {}
+    base_text = "✅ Kino kanalga muvaffaqiyatli joylandi!" if posted_to_channel else "✅ Qism saqlandi!"
     if nm.get("is_series"):
         context.user_data["state"] = "await_series_more"
         await msg.reply_text(
-            "✅ Kino kanalga muvaffaqiyatli joylandi!\n\n"
-            "➕ Shu serialga yana qism qo'shasizmi?",
+            f"{base_text}\n\n➕ Shu serialga yana qism qo'shasizmi?",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("✅ Ha, yana qism qo'shish", callback_data="series_more_yes")],
                 [InlineKeyboardButton("🏁 Yo'q, tugatish", callback_data="series_more_no")],
@@ -1675,7 +1677,7 @@ async def finish_or_continue_series(msg, context: ContextTypes.DEFAULT_TYPE):
         )
     else:
         context.user_data.pop("new_movie", None)
-        await msg.reply_text("✅ Kino kanalga muvaffaqiyatli joylandi!", reply_markup=current_admin_keyboard(context))
+        await msg.reply_text(base_text, reply_markup=current_admin_keyboard(context))
 
 
 # ============================== MEDIA HANDLER ==============================
@@ -1693,6 +1695,15 @@ async def media_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         add_movie(nm["code"], nm["episode"], nm.get("title", ""), nm.get("genre", ""),
                    nm.get("language", ""), nm.get("country", ""), file_id, file_type, mode,
                    nm.get("is_series", 0))
+
+        # Serial bo'lsa, kanalga FAQAT 1-qismda xabar yuboriladi (poster/teaser bilan).
+        # Keyingi qismlar (2, 3, 4...) uchun kanalga qayta post qilinmaydi — foydalanuvchi
+        # o'sha bitta kod orqali botdan barcha qismlarni ko'ra oladi.
+        if nm.get("is_series") and nm.get("episode", 1) != 1:
+            context.user_data.pop("state", None)
+            await finish_or_continue_series(msg, context, posted_to_channel=False)
+            return
+
         movie = get_movie_episode(nm["code"], nm["episode"])
         context.user_data["last_movie"] = dict(movie)
 
