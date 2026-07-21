@@ -697,8 +697,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not_subs:
         context.user_data["pending_code"] = pending_code
         await update.message.reply_text(
-            "⚠️ Botdan foydalanish uchun quyidagi kanal/guruhlarga obuna bo'ling (yopiq bo'lsa — so'rov "
-            "yuboring), so'ng \"✅ Tekshirdim\" tugmasini bosing:",
+            "⚠️ Botdan foydalanish uchun quyidagi kanalllarga azo bo'lib \"✅ Tekshirdim\" tugmasini bosing:",
             reply_markup=kb_subscription(not_subs),
         )
         return
