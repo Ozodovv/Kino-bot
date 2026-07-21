@@ -1130,6 +1130,29 @@ async def admin_callback_router(query, context: ContextTypes.DEFAULT_TYPE, data:
         await query.message.edit_text("🎬 Boshqa kino kodini kiriting:")
         return
 
+    # ---- Serial joylangandan keyin: yana qism qo'shish yoki tugatish ----
+    if data == "series_more_yes":
+        nm = context.user_data.get("new_movie") or {}
+        # Kod/sarlavha/janr/til/davlat/mode saqlanib qoladi — faqat yangi qism raqami va fayli so'raladi
+        context.user_data["new_movie"] = {
+            "code": nm.get("code"),
+            "title": nm.get("title", ""),
+            "genre": nm.get("genre", ""),
+            "language": nm.get("language", ""),
+            "country": nm.get("country", ""),
+            "mode": nm.get("mode", "full"),
+            "is_series": 1,
+        }
+        context.user_data["state"] = "await_movie_episode"
+        await query.message.edit_text("🔢 Nechanchi qism ekanini kiriting:")
+        return
+
+    if data == "series_more_no":
+        context.user_data.pop("new_movie", None)
+        context.user_data.pop("state", None)
+        await query.message.edit_text("🏁 Serial yuklash yakunlandi.")
+        return
+
     # ---- Kinoni o'chirish ----
     if data.startswith("movdelall_"):
         code = data.split("_", 1)[1]
@@ -1632,6 +1655,26 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await process_movie_code(update.message, context, text, user.id)
 
 
+async def finish_or_continue_series(msg, context: ContextTypes.DEFAULT_TYPE):
+    """Kino/serial kanalga joylangandan keyin chaqiriladi.
+    Faqat SERIAL bo'lsa ("yana qism qo'shasizmi?" deb so'raydi), oddiy kino bo'lsa
+    darhol tugaydi va hech narsa so'ramaydi."""
+    nm = context.user_data.get("new_movie") or {}
+    if nm.get("is_series"):
+        context.user_data["state"] = "await_series_more"
+        await msg.reply_text(
+            "✅ Kino kanalga muvaffaqiyatli joylandi!\n\n"
+            "➕ Shu serialga yana qism qo'shasizmi?",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Ha, yana qism qo'shish", callback_data="series_more_yes")],
+                [InlineKeyboardButton("🏁 Yo'q, tugatish", callback_data="series_more_no")],
+            ]),
+        )
+    else:
+        context.user_data.pop("new_movie", None)
+        await msg.reply_text("✅ Kino kanalga muvaffaqiyatli joylandi!", reply_markup=current_admin_keyboard(context))
+
+
 # ============================== MEDIA HANDLER ==============================
 
 async def media_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1645,7 +1688,8 @@ async def media_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         nm = context.user_data["new_movie"]
         mode = nm.get("mode", "full")
         add_movie(nm["code"], nm["episode"], nm.get("title", ""), nm.get("genre", ""),
-                   nm.get("language", ""), nm.get("country", ""), file_id, file_type, mode)
+                   nm.get("language", ""), nm.get("country", ""), file_id, file_type, mode,
+                   nm.get("is_series", 0))
         movie = get_movie_episode(nm["code"], nm["episode"])
         context.user_data["last_movie"] = dict(movie)
 
@@ -1680,7 +1724,7 @@ async def media_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await msg.reply_text("⚠️ Kanalga yuborishda xatolik (bot admin ekanligini tekshiring).")
         context.user_data.pop("state", None)
         context.user_data.pop("last_movie", None)
-        await msg.reply_text("✅ Kino kanalga muvaffaqiyatli joylandi!", reply_markup=current_admin_keyboard(context))
+        await finish_or_continue_series(msg, context)
         return
 
     # ---------- Promo video (teaser) ----------
@@ -1705,7 +1749,7 @@ async def media_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await msg.reply_text("⚠️ Kanalga yuborishda xatolik (bot admin ekanligini tekshiring).")
         context.user_data.pop("state", None)
         context.user_data.pop("last_movie", None)
-        await msg.reply_text("✅ Kino kanalga muvaffaqiyatli joylandi!", reply_markup=current_admin_keyboard(context))
+        await finish_or_continue_series(msg, context)
         return
 
 
