@@ -579,7 +579,10 @@ async def check_subscription(context: ContextTypes.DEFAULT_TYPE, user_id: int) -
     """Obuna bo'lmagan kanal/guruhlar ro'yxatini qaytaradi.
     Ommaviy: haqiqiy a'zolik tekshiriladi (get_chat_member).
     Maxfiy: bot HECH KIMNI tasdiqlamaydi — faqat foydalanuvchi so'rov
-    yuborganmi (join_requests jadvalida yozuv bormi) shu tekshiriladi."""
+    yuborganmi (join_requests jadvalida yozuv bormi) shu tekshiriladi.
+    ADMINLARDAN majburiy obuna umuman so'ralmaydi."""
+    if is_admin(user_id):
+        return []
     not_subscribed = []
     for ch in get_mandatory_channels():
         if ch["ctype"] == "private":
@@ -1014,7 +1017,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ---------- Quyidagilar faqat adminlar uchun ----------
     if data.startswith(("admin_panel", "padd_", "uptype_", "upmode_", "chdel_", "admdel_",
-                         "balchg_", "codeconf_", "movdel_", "movdelall_")):
+                         "balchg_", "codeconf_", "movdel_", "movdelall_", "series_more_")):
         if not is_admin(user.id):
             await query.answer("⛔️ Sizda ruxsat yo'q.", show_alert=True)
             return
