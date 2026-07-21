@@ -5,6 +5,8 @@ KinoHub Pro Bot — to'liq funksional Telegram kino-bot (v2)
 
 O'RNATISH:
     pip install python-telegram-bot --upgrade
+    (Kunlik avtomatik baza zaxirasi ishlashi uchun ixtiyoriy: )
+    pip install "python-telegram-bot[job-queue]" --upgrade
 
 SOZLASH (2 usul bor):
     1) Fayl ichida pastdagi "SOZLAMALAR" bo'limini to'ldiring, YOKI
@@ -23,6 +25,7 @@ ISHGA TUSHIRISH:
 """
 
 import os
+import asyncio
 import logging
 import sqlite3
 import datetime
@@ -370,6 +373,21 @@ def delete_movie(movie_id: int):
         conn.execute("DELETE FROM movies WHERE id=?", (movie_id,))
 
 
+def get_movie_by_id(movie_id: int):
+    with closing(get_conn()) as conn:
+        return conn.execute("SELECT * FROM movies WHERE id=?", (movie_id,)).fetchone()
+
+
+_EDITABLE_MOVIE_FIELDS = {"title", "genre", "language", "country", "episode"}
+
+
+def update_movie_field(movie_id: int, field: str, value):
+    if field not in _EDITABLE_MOVIE_FIELDS:
+        return
+    with closing(get_conn()) as conn, conn:
+        conn.execute(f"UPDATE movies SET {field}=? WHERE id=?", (value, movie_id))
+
+
 def delete_movies_by_code(code: str):
     with closing(get_conn()) as conn, conn:
         conn.execute("DELETE FROM movies WHERE code=?", (code,))
@@ -481,6 +499,26 @@ def stats_breakdown(kind: str):
     return results
 
 
+def general_stats():
+    """Umumiy (butun davr) statistika: jami sonlar + eng ko'p yuklab olingan top-5 kino."""
+    with closing(get_conn()) as conn:
+        total_users = conn.execute("SELECT COUNT(*) c FROM users").fetchone()["c"]
+        total_codes = conn.execute("SELECT COUNT(DISTINCT code) c FROM movies").fetchone()["c"]
+        total_episodes = conn.execute("SELECT COUNT(*) c FROM movies").fetchone()["c"]
+        total_downloads = conn.execute("SELECT COALESCE(SUM(downloads), 0) c FROM movies").fetchone()["c"]
+        top = conn.execute(
+            "SELECT code, MAX(title) AS title, SUM(downloads) AS total_dl "
+            "FROM movies GROUP BY code ORDER BY total_dl DESC LIMIT 5"
+        ).fetchall()
+    return {
+        "total_users": total_users,
+        "total_codes": total_codes,
+        "total_episodes": total_episodes,
+        "total_downloads": total_downloads,
+        "top": top,
+    }
+
+
 # ============================== INLINE KLAVIATURALAR (oddiy foydalanuvchi) ==============================
 
 def kb_main_menu(user_id: int) -> InlineKeyboardMarkup:
@@ -526,10 +564,11 @@ def kb_back(callback_data: str) -> InlineKeyboardMarkup:
 
 RK_MAIN = ReplyKeyboardMarkup([
     ["📡 Kanallar", "🎬 Kino yuklash"],
-    ["🗑 Kino o'chirish", "📢 Xabarnoma"],
-    ["📊 Statistika", "⚙️ Bot holati"],
+    ["✏️ Tahrirlash", "🗑 Kino o'chirish"],
+    ["📢 Xabarnoma", "📊 Statistika"],
     ["👮 Adminlar", "💳 To'lovlar"],
     ["🔧 Sozlamalar", "🔎 Foydalanuvchini tekshirish"],
+    ["⚙️ Bot holati", "💾 Baza zaxirasi"],
     ["⬅️ Chiqish"],
 ], resize_keyboard=True)
 
@@ -551,6 +590,7 @@ RK_SETTINGS = ReplyKeyboardMarkup([
 
 RK_STATS = ReplyKeyboardMarkup([
     ["📅 Kunlik", "🗓 Haftalik", "📆 Oylik"],
+    ["📈 Umumiy"],
     ["⬅️ Orqaga"],
 ], resize_keyboard=True)
 
@@ -1017,7 +1057,8 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ---------- Quyidagilar faqat adminlar uchun ----------
     if data.startswith(("admin_panel", "padd_", "uptype_", "upmode_", "chdel_", "admdel_",
-                         "balchg_", "codeconf_", "movdel_", "movdelall_", "series_more_")):
+                         "balchg_", "codeconf_", "movdel_", "movdelall_", "series_more_",
+                         "medit_", "mfield_")):
         if not is_admin(user.id):
             await query.answer("⛔️ Sizda ruxsat yo'q.", show_alert=True)
             return
@@ -1169,6 +1210,26 @@ async def admin_callback_router(query, context: ContextTypes.DEFAULT_TYPE, data:
         await query.message.edit_text("✅ Kino o'chirildi.")
         return
 
+    # ---- Kinoni tahrirlash: qismni tanlash ----
+    if data.startswith("medit_"):
+        movie_id = int(data.split("_", 1)[1])
+        movie = get_movie_by_id(movie_id)
+        if not movie:
+            await query.answer("❌ Topilmadi", show_alert=True)
+            return
+        await query.message.edit_text(movie_edit_text(movie), reply_markup=kb_edit_movie(movie))
+        return
+
+    # ---- Kinoni tahrirlash: maydonni tanlash ----
+    if data.startswith("mfield_"):
+        _, field, movie_id_s = data.split("_", 2)
+        movie_id = int(movie_id_s)
+        context.user_data["state"] = "await_edit_value"
+        context.user_data["edit_target"] = {"id": movie_id, "field": field}
+        prompt = "🔢 Yangi qism raqamini kiriting:" if field == "episode" else "✏️ Yangi qiymatni kiriting:"
+        await query.message.edit_text(prompt)
+        return
+
     # ---- Kanal/guruhni ro'yxatdan o'chirish ----
     if data.startswith("chdel_"):
         ch_id = int(data.split("_", 1)[1])
@@ -1252,6 +1313,104 @@ async def show_payments_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.message.reply_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(kb_rows))
 
 
+# ============================== KINO TAHRIRLASH ==============================
+
+def kb_edit_movie(movie) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton("📌 Nomi", callback_data=f"mfield_title_{movie['id']}")],
+        [InlineKeyboardButton("🎞 Janr", callback_data=f"mfield_genre_{movie['id']}")],
+        [InlineKeyboardButton("🗣 Til", callback_data=f"mfield_language_{movie['id']}")],
+        [InlineKeyboardButton("🌍 Davlat", callback_data=f"mfield_country_{movie['id']}")],
+    ]
+    if movie["is_series"]:
+        rows.append([InlineKeyboardButton("🔢 Qism raqami", callback_data=f"mfield_episode_{movie['id']}")])
+    return InlineKeyboardMarkup(rows)
+
+
+def movie_edit_text(movie) -> str:
+    header = f"✏️ Tahrirlash — kod: {movie['code']}"
+    if movie["is_series"]:
+        header += f" ({movie['episode']}-qism)"
+    return (
+        f"{header}\n\n"
+        f"📌 Nomi: {movie['title'] or '-'}\n"
+        f"🎞 Janr: {movie['genre'] or '-'}\n"
+        f"🗣 Til: {movie['language'] or '-'}\n"
+        f"🌍 Davlat: {movie['country'] or '-'}\n\n"
+        "Qaysi maydonni o'zgartirmoqchisiz?"
+    )
+
+
+# ============================== BAZA ZAXIRASI ==============================
+
+async def send_db_backup(msg, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        with closing(get_conn()) as conn:
+            conn.execute("PRAGMA wal_checkpoint(FULL)")
+    except sqlite3.Error:
+        pass
+    now = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M")
+    try:
+        with open(DB_PATH, "rb") as f:
+            await msg.reply_document(
+                document=f,
+                filename=f"kinobot_backup_{now}.db",
+                caption=f"💾 Baza zaxirasi — {now}",
+            )
+    except FileNotFoundError:
+        await msg.reply_text("❌ Baza fayli topilmadi.")
+    except TelegramError as e:
+        await msg.reply_text(f"⚠️ Zaxirani yuborishda xatolik: {e}")
+
+
+async def scheduled_backup_job(context: ContextTypes.DEFAULT_TYPE):
+    """Har kuni avtomatik ishga tushib, bazani barcha adminlarga yuboradi."""
+    try:
+        with closing(get_conn()) as conn:
+            conn.execute("PRAGMA wal_checkpoint(FULL)")
+    except sqlite3.Error:
+        pass
+    now = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M")
+    for admin_id in get_admin_ids():
+        try:
+            with open(DB_PATH, "rb") as f:
+                await context.bot.send_document(
+                    admin_id,
+                    document=f,
+                    filename=f"kinobot_backup_{now}.db",
+                    caption=f"💾 Kunlik avtomatik baza zaxirasi — {now}",
+                )
+        except (TelegramError, FileNotFoundError):
+            pass
+
+
+# ============================== XABARNOMA (BROADCAST) ==============================
+
+async def run_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Adminning matn/rasm/video/hujjat xabarini BARCHA foydalanuvchilarga yuboradi.
+    copy_message ishlatiladi — shu sababli xabar turi muhim emas."""
+    context.user_data.pop("state", None)
+    src = update.message
+    ids = all_user_ids()
+    status_msg = await src.reply_text(
+        f"📤 Yuborilmoqda... (0/{len(ids)})", reply_markup=current_admin_keyboard(context)
+    )
+    sent, failed = 0, 0
+    for i, uid in enumerate(ids, 1):
+        try:
+            await context.bot.copy_message(chat_id=uid, from_chat_id=src.chat_id, message_id=src.message_id)
+            sent += 1
+        except (Forbidden, TelegramError):
+            failed += 1
+        if i % 25 == 0:
+            try:
+                await status_msg.edit_text(f"📤 Yuborilmoqda... ({i}/{len(ids)})")
+            except TelegramError:
+                pass
+        await asyncio.sleep(0.05)  # Telegram flood-limitiga tushib qolmaslik uchun
+    await src.reply_text(f"✅ Xabar {sent}/{len(ids)} foydalanuvchiga yuborildi ({failed} ta yetib bormadi).")
+
+
 # ============================== ADMIN MENYU (Reply Keyboard) ROUTERI ==============================
 
 async def admin_menu_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -1299,6 +1458,12 @@ async def admin_menu_text_handler(update: Update, context: ContextTypes.DEFAULT_
         )
         return True
 
+    if text == "✏️ Tahrirlash":
+        context.user_data["admin_level"] = "main"
+        context.user_data["state"] = "await_edit_code"
+        await update.message.reply_text("✏️ Tahrirlamoqchi bo'lgan kino kodini kiriting:")
+        return True
+
     if text == "🗑 Kino o'chirish":
         context.user_data["admin_level"] = "main"
         context.user_data["state"] = "await_delete_code"
@@ -1308,13 +1473,21 @@ async def admin_menu_text_handler(update: Update, context: ContextTypes.DEFAULT_
     if text == "📢 Xabarnoma":
         context.user_data["admin_level"] = "main"
         context.user_data["state"] = "await_broadcast"
-        await update.message.reply_text("📢 Barcha foydalanuvchilarga yuboriladigan xabar matnini kiriting:",
-                                         reply_markup=ReplyKeyboardRemove())
+        await update.message.reply_text(
+            "📢 Barcha foydalanuvchilarga yuboriladigan xabarni kiriting.\n"
+            "Matn, rasm, video yoki hujjat — istalgan turda yuborishingiz mumkin:",
+            reply_markup=ReplyKeyboardRemove(),
+        )
         return True
 
     if text == "📊 Statistika":
         context.user_data["admin_level"] = "stats"
         await update.message.reply_text("📊 Davrni tanlang:", reply_markup=RK_STATS)
+        return True
+
+    if text == "💾 Baza zaxirasi":
+        context.user_data["admin_level"] = "main"
+        await send_db_backup(update.message, context)
         return True
 
     if text == "⚙️ Bot holati":
@@ -1393,6 +1566,24 @@ async def admin_menu_text_handler(update: Update, context: ContextTypes.DEFAULT_
         await update.message.reply_text("\n".join(lines))
         return True
 
+    if text == "📈 Umumiy":
+        context.user_data["admin_level"] = "stats"
+        gs = general_stats()
+        lines = [
+            "📈 Umumiy statistika:\n",
+            f"👥 Jami foydalanuvchilar: {gs['total_users']} ta",
+            f"🎬 Jami kinolar (kodlar): {gs['total_codes']} ta",
+            f"🎞 Jami qismlar (fayllar): {gs['total_episodes']} ta",
+            f"⬇️ Jami yuklab olishlar: {gs['total_downloads']} ta",
+        ]
+        if gs["top"]:
+            lines.append("\n🏆 Top-5 eng ko'p yuklab olingan kino:")
+            for i, row in enumerate(gs["top"], 1):
+                title_display = row["title"] or f"Kod {row['code']}"
+                lines.append(f"{i}. {title_display} (kod: {row['code']}) — {row['total_dl'] or 0} ta")
+        await update.message.reply_text("\n".join(lines))
+        return True
+
     if text in ("🔴 O'chirish", "🟢 Yoqish"):
         context.user_data["admin_level"] = "status"
         current = get_setting("bot_enabled")
@@ -1459,17 +1650,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ---------- Xabarnoma ----------
     if state == "await_broadcast":
-        context.user_data.pop("state", None)
-        ids = all_user_ids()
-        sent = 0
-        for uid in ids:
-            try:
-                await context.bot.send_message(uid, text)
-                sent += 1
-            except (Forbidden, TelegramError):
-                pass
-        await update.message.reply_text(f"✅ Xabar {sent}/{len(ids)} foydalanuvchiga yuborildi.",
-                                         reply_markup=current_admin_keyboard(context))
+        await run_broadcast(update, context)
         return
 
     # ---------- Foydalanuvchini tekshirish ----------
@@ -1524,6 +1705,53 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(target_id, user_msg)
         except TelegramError:
             pass
+        return
+
+    # ---------- Kino tahrirlash ----------
+    if state == "await_edit_code":
+        context.user_data.pop("state", None)
+        episodes = get_movies_by_code(text)
+        if not episodes:
+            await update.message.reply_text("❌ Bunday kodli kino topilmadi.",
+                                              reply_markup=current_admin_keyboard(context))
+            return
+        if len(episodes) == 1:
+            movie = episodes[0]
+            await update.message.reply_text(movie_edit_text(movie), reply_markup=kb_edit_movie(movie))
+        else:
+            rows = [
+                [InlineKeyboardButton(f"✏️ {m['episode']}-qism", callback_data=f"medit_{m['id']}")]
+                for m in episodes
+            ]
+            await update.message.reply_text(
+                f"Bu kodga {len(episodes)} ta qism bor. Qaysi birini tahrirlaymiz?",
+                reply_markup=InlineKeyboardMarkup(rows),
+            )
+        return
+
+    if state == "await_edit_value":
+        target = context.user_data.get("edit_target")
+        if not target:
+            context.user_data.pop("state", None)
+            return
+        field = target["field"]
+        if field == "episode":
+            if not text.isdigit():
+                await update.message.reply_text("❌ Faqat raqam kiriting.")
+                return
+            value = int(text)
+        else:
+            value = text
+        update_movie_field(target["id"], field, value)
+        context.user_data.pop("state", None)
+        context.user_data.pop("edit_target", None)
+        movie = get_movie_by_id(target["id"])
+        if not movie:
+            await update.message.reply_text("✅ Yangilandi.", reply_markup=current_admin_keyboard(context))
+            return
+        await update.message.reply_text(
+            "✅ Yangilandi!\n\n" + movie_edit_text(movie), reply_markup=kb_edit_movie(movie)
+        )
         return
 
     # ---------- Kino o'chirish ----------
@@ -1686,6 +1914,11 @@ async def media_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = context.user_data.get("state")
     msg = update.message
 
+    # ---------- Xabarnoma (rasm/video/hujjat bilan) ----------
+    if state == "await_broadcast":
+        await run_broadcast(update, context)
+        return
+
     # ---------- Kino faylini qabul qilish ----------
     if state == "await_movie_file" and (msg.video or msg.document):
         file_id = msg.video.file_id if msg.video else msg.document.file_id
@@ -1812,6 +2045,17 @@ def main():
     app.add_handler(MessageHandler(
         filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, text_handler
     ))
+
+    # ---- Kunlik avtomatik baza zaxirasi (har kuni soat 03:00 da barcha adminlarga yuboriladi) ----
+    if app.job_queue is not None:
+        app.job_queue.run_daily(scheduled_backup_job, time=datetime.time(hour=3, minute=0), name="daily_db_backup")
+        print("✅ Kunlik avtomatik baza zaxirasi yoqildi (har kuni 03:00 da adminlarga yuboriladi).")
+    else:
+        print(
+            "ℹ️ JobQueue o'rnatilmagan — avtomatik kunlik zaxira ISHLAMAYDI "
+            "('💾 Baza zaxirasi' tugmasi orqali qo'lda olish esa ishlayveradi).\n"
+            "   Yoqish uchun: pip install \"python-telegram-bot[job-queue]\" --upgrade"
+        )
 
     print("🤖 Bot ishga tushdi...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
