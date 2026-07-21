@@ -111,7 +111,6 @@ def init_db():
                 file_id     TEXT,
                 file_type   TEXT,
                 mode        TEXT DEFAULT 'full',   -- 'full' (rasm, tolq malumot) yoki 'simple' (qisqa video)
-                is_series   INTEGER DEFAULT 0,      -- 0=oddiy kino, 1=serial (kod band bolish mantigi uchun)
                 downloads   INTEGER DEFAULT 0,
                 created_at  TEXT
             );
@@ -123,13 +122,6 @@ def init_db():
                 downloaded_at TEXT
             );
 
-            CREATE TABLE IF NOT EXISTS join_requests (
-                chat_id      INTEGER,
-                user_id      INTEGER,
-                requested_at TEXT,
-                PRIMARY KEY (chat_id, user_id)
-            );
-
             CREATE TABLE IF NOT EXISTS channels (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 chat_id     INTEGER,
@@ -137,7 +129,8 @@ def init_db():
                 invite_link TEXT,
                 title       TEXT,
                 ctype       TEXT,     -- 'public' yoki 'private'
-                kind        TEXT      -- 'channel' yoki 'group'
+                kind        TEXT,     -- 'channel' yoki 'group'
+                chat_type   TEXT      -- telegram xom turi: 'channel' | 'supergroup' | 'group'
             );
 
             CREATE TABLE IF NOT EXISTS pending_chats (
@@ -145,6 +138,7 @@ def init_db():
                 title       TEXT,
                 username    TEXT,
                 kind        TEXT,
+                chat_type   TEXT,
                 detected_at TEXT
             );
 
@@ -178,7 +172,8 @@ def init_db():
         _safe_add_column(conn, "users", "ref_bonus_given INTEGER DEFAULT 0")
         _safe_add_column(conn, "channels", "kind TEXT DEFAULT 'channel'")
         _safe_add_column(conn, "movies", "mode TEXT DEFAULT 'full'")
-        _safe_add_column(conn, "movies", "is_series INTEGER DEFAULT 0")
+        _safe_add_column(conn, "channels", "chat_type TEXT")
+        _safe_add_column(conn, "pending_chats", "chat_type TEXT")
 
         defaults = {
             "movie_channel_username": "",
@@ -265,19 +260,19 @@ def get_mandatory_channels():
         return conn.execute("SELECT * FROM channels ORDER BY id").fetchall()
 
 
-def add_channel(chat_id, username, invite_link, title, ctype, kind):
+def add_channel(chat_id, username, invite_link, title, ctype, kind, chat_type=None):
     with closing(get_conn()) as conn, conn:
         existing = conn.execute("SELECT id FROM channels WHERE chat_id=?", (chat_id,)).fetchone()
         if existing:
             conn.execute(
-                "UPDATE channels SET username=?, invite_link=?, title=?, ctype=?, kind=? WHERE chat_id=?",
-                (username, invite_link, title, ctype, kind, chat_id),
+                "UPDATE channels SET username=?, invite_link=?, title=?, ctype=?, kind=?, chat_type=? WHERE chat_id=?",
+                (username, invite_link, title, ctype, kind, chat_type, chat_id),
             )
         else:
             conn.execute(
-                "INSERT INTO channels (chat_id, username, invite_link, title, ctype, kind) "
-                "VALUES (?,?,?,?,?,?)",
-                (chat_id, username, invite_link, title, ctype, kind),
+                "INSERT INTO channels (chat_id, username, invite_link, title, ctype, kind, chat_type) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (chat_id, username, invite_link, title, ctype, kind, chat_type),
             )
 
 
@@ -291,15 +286,26 @@ def get_channel_by_id(channel_id: int):
         return conn.execute("SELECT * FROM channels WHERE id=?", (channel_id,)).fetchone()
 
 
+def get_channel_by_chat_id(chat_id: int):
+    with closing(get_conn()) as conn:
+        return conn.execute("SELECT * FROM channels WHERE chat_id=?", (chat_id,)).fetchone()
+
+
+def update_channel_chat_id(old_chat_id: int, new_chat_id: int):
+    with closing(get_conn()) as conn, conn:
+        conn.execute("UPDATE channels SET chat_id=? WHERE chat_id=?", (new_chat_id, old_chat_id))
+        conn.execute("UPDATE pending_chats SET chat_id=? WHERE chat_id=?", (new_chat_id, old_chat_id))
+
+
 # ---- Aniqlangan (pending) chatlar ----
 
-def upsert_pending_chat(chat_id, title, username, kind):
+def upsert_pending_chat(chat_id, title, username, kind, chat_type=None):
     with closing(get_conn()) as conn, conn:
         conn.execute(
-            "INSERT INTO pending_chats (chat_id, title, username, kind, detected_at) VALUES (?,?,?,?,?) "
+            "INSERT INTO pending_chats (chat_id, title, username, kind, chat_type, detected_at) VALUES (?,?,?,?,?,?) "
             "ON CONFLICT(chat_id) DO UPDATE SET title=excluded.title, username=excluded.username, "
-            "kind=excluded.kind, detected_at=excluded.detected_at",
-            (chat_id, title, username, kind, datetime.datetime.now().isoformat()),
+            "kind=excluded.kind, chat_type=excluded.chat_type, detected_at=excluded.detected_at",
+            (chat_id, title, username, kind, chat_type, datetime.datetime.now().isoformat()),
         )
 
 
@@ -311,24 +317,6 @@ def get_pending_chat(chat_id: int):
 def delete_pending_chat(chat_id: int):
     with closing(get_conn()) as conn, conn:
         conn.execute("DELETE FROM pending_chats WHERE chat_id=?", (chat_id,))
-
-
-# ---- Maxfiy kanal/guruh sorovlari (faqat QAYD qilinadi, avtomatik tasdiqlanmaydi) ----
-
-def record_join_request(chat_id: int, user_id: int):
-    with closing(get_conn()) as conn, conn:
-        conn.execute(
-            "INSERT OR IGNORE INTO join_requests (chat_id, user_id, requested_at) VALUES (?, ?, ?)",
-            (chat_id, user_id, datetime.datetime.now().isoformat()),
-        )
-
-
-def has_join_request(chat_id: int, user_id: int) -> bool:
-    with closing(get_conn()) as conn:
-        row = conn.execute(
-            "SELECT 1 FROM join_requests WHERE chat_id=? AND user_id=?", (chat_id, user_id)
-        ).fetchone()
-        return row is not None
 
 
 # ---- Kinolar ----
@@ -345,34 +333,14 @@ def get_movie_episode(code: str, episode: int):
         ).fetchone()
 
 
-def add_movie(code, episode, title, genre, language, country, file_id, file_type, mode="full", is_series=0):
+def add_movie(code, episode, title, genre, language, country, file_id, file_type, mode="full"):
     with closing(get_conn()) as conn, conn:
-        existing = conn.execute(
-            "SELECT id FROM movies WHERE code=? AND episode=?", (code, episode)
-        ).fetchone()
-        if existing:
-            conn.execute(
-                "UPDATE movies SET title=?, genre=?, language=?, country=?, file_id=?, "
-                "file_type=?, mode=?, is_series=? WHERE id=?",
-                (title, genre, language, country, file_id, file_type, mode, is_series, existing["id"]),
-            )
-        else:
-            conn.execute(
-                "INSERT INTO movies (code, episode, title, genre, language, country, file_id, "
-                "file_type, mode, is_series, downloads, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,0,?)",
-                (code, episode, title, genre, language, country, file_id, file_type, mode, is_series,
-                 datetime.datetime.now().isoformat()),
-            )
-
-
-def delete_movie(movie_id: int):
-    with closing(get_conn()) as conn, conn:
-        conn.execute("DELETE FROM movies WHERE id=?", (movie_id,))
-
-
-def delete_movies_by_code(code: str):
-    with closing(get_conn()) as conn, conn:
-        conn.execute("DELETE FROM movies WHERE code=?", (code,))
+        conn.execute(
+            "INSERT INTO movies (code, episode, title, genre, language, country, "
+            "file_id, file_type, mode, downloads, created_at) VALUES (?,?,?,?,?,?,?,?,?,0,?)",
+            (code, episode, title, genre, language, country, file_id, file_type, mode,
+             datetime.datetime.now().isoformat()),
+        )
 
 
 def increment_downloads(movie_id: int):
@@ -526,10 +494,10 @@ def kb_back(callback_data: str) -> InlineKeyboardMarkup:
 
 RK_MAIN = ReplyKeyboardMarkup([
     ["📡 Kanallar", "🎬 Kino yuklash"],
-    ["🗑 Kino o'chirish", "📢 Xabarnoma"],
-    ["📊 Statistika", "⚙️ Bot holati"],
-    ["👮 Adminlar", "💳 To'lovlar"],
-    ["🔧 Sozlamalar", "🔎 Foydalanuvchini tekshirish"],
+    ["📢 Xabarnoma", "📊 Statistika"],
+    ["⚙️ Bot holati", "👮 Adminlar"],
+    ["💳 To'lovlar", "🔧 Sozlamalar"],
+    ["🔎 Foydalanuvchini tekshirish"],
     ["⬅️ Chiqish"],
 ], resize_keyboard=True)
 
@@ -572,26 +540,16 @@ def current_admin_keyboard(context: ContextTypes.DEFAULT_TYPE) -> ReplyKeyboardM
 
 # ============================== MAJBURIY OBUNA ==============================
 
-MAX_MANDATORY_CHANNELS = 10
-
-
 async def check_subscription(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> list:
-    """Obuna bo'lmagan kanal/guruhlar ro'yxatini qaytaradi.
-    Ommaviy: haqiqiy a'zolik tekshiriladi (get_chat_member).
-    Maxfiy: bot HECH KIMNI tasdiqlamaydi — faqat foydalanuvchi so'rov
-    yuborganmi (join_requests jadvalida yozuv bormi) shu tekshiriladi."""
+    """Obuna bo'lmagan kanal/guruhlar ro'yxatini qaytaradi."""
     not_subscribed = []
     for ch in get_mandatory_channels():
-        if ch["ctype"] == "private":
-            if not has_join_request(ch["chat_id"], user_id):
+        try:
+            member = await context.bot.get_chat_member(ch["chat_id"], user_id)
+            if member.status in (ChatMemberStatus.LEFT, ChatMemberStatus.BANNED):
                 not_subscribed.append(ch)
-        else:
-            try:
-                member = await context.bot.get_chat_member(ch["chat_id"], user_id)
-                if member.status in (ChatMemberStatus.LEFT, ChatMemberStatus.BANNED):
-                    not_subscribed.append(ch)
-            except TelegramError:
-                not_subscribed.append(ch)
+        except TelegramError:
+            not_subscribed.append(ch)
     return not_subscribed
 
 
@@ -643,10 +601,9 @@ async def notify_admins_new_user(context: ContextTypes.DEFAULT_TYPE, user):
         + tg_line +
         f"🕒 Vaqt: {now.strftime('%d.%m.%Y')} | {now.strftime('%H:%M:%S')}"
     )
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("👁 Ko'rish", url=f"tg://user?id={user.id}")]])
     for admin_id in get_admin_ids():
         try:
-            await context.bot.send_message(admin_id, text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+            await context.bot.send_message(admin_id, text, parse_mode=ParseMode.MARKDOWN)
         except TelegramError:
             pass
 
@@ -816,20 +773,29 @@ async def my_chat_member_handler(update: Update, context: ContextTypes.DEFAULT_T
         return  # faqat "hozirgina admin qilingan" holatini ushlaymiz
 
     kind = "channel" if chat.type == ChatType.CHANNEL else "group"
-    upsert_pending_chat(chat.id, chat.title or chat.username or str(chat.id), chat.username, kind)
+    upsert_pending_chat(chat.id, chat.title or chat.username or str(chat.id), chat.username, kind, chat.type)
 
     label = "Kanal" if kind == "channel" else "Guruh"
     uname_line = f"🔗 Username: @{chat.username}\n" if chat.username else "🔗 Username: yo'q (maxfiy)\n"
+    warn_line = ""
+    if chat.type == ChatType.GROUP:
+        warn_line = (
+            "\n⚠️ Bu — oddiy (eski turdagi) guruh. Uni maxfiy majburiy obunaga qo'shish uchun "
+            "avval *supergroup*ga aylantirish kerak: guruh sozlamalarida istalgan supergroup-only "
+            "funksiyani yoqing (masalan \"Yangi a'zolarni tasdiqlash\" yoki \"Chat tarixi\"), guruh "
+            "avtomatik supergroupga aylanadi. Shundan keyin pastdagi tugmani qayta bosing.\n"
+        )
     text = (
         f"✅ Men yangi {label.lower()}da ADMIN qilib tayinlandim!\n\n"
         f"📌 Nomi: {chat.title or '-'}\n"
         + uname_line +
-        f"🆔 Chat ID: `{chat.id}`\n\n"
-        "Bu chatni qanday ishlatamiz?\n\n"
-        "⚠️ Eslatma: agar bu chatda username bo'lmasa (maxfiy), foydalanuvchilar "
-        "qo'shilish so'rovi yuboradi. Men bu so'rovlarni AVTOMATIK TASDIQLAMAYMAN — "
-        "faqat so'rov yuborilganini tekshiraman. Haqiqiy a'zolikni siz (yoki shu "
-        "chatning boshqa adminlari) o'zingiz tasdiqlaysiz."
+        f"🆔 Chat ID: `{chat.id}`\n"
+        + warn_line +
+        "\nBu chatni qanday ishlatamiz?\n\n"
+        "⚠️ Eslatma: agar 'Majburiy obunaga qo'shish'ni tanlasangiz va bu chatda username "
+        "bo'lmasa (maxfiy), foydalanuvchilar so'rov yuborishi va men uni avtomatik "
+        "tasdiqlashim uchun menda \"Foydalanuvchilarni taklif qilish\" (Invite Users) "
+        "huquqi borligiga ishonch hosil qiling."
     )
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Majburiy obunaga qo'shish", callback_data=f"padd_add_{chat.id}")],
@@ -844,19 +810,60 @@ async def my_chat_member_handler(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def join_request_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Maxfiy kanal/guruhga kelgan so'rovni AVTOMATIK TASDIQLAMAYDI —
-    faqat foydalanuvchi so'rov yuborganini bazaga qayd qiladi. Haqiqiy
-    tasdiqlash o'sha kanal/guruhning o'z egasi/adminlari tomonidan amalga
-    oshiriladi."""
+    """Maxfiy kanal/guruhga kelgan qo'shilish so'rovlarini tekshirib, faqat bot
+    ro'yxatidan o'tgan (majburiy obuna yoki kino kanali sifatida ulangan) chatlar
+    uchun avtomatik tasdiqlaydi. Ro'yxatda yo'q, tanish bo'lmagan chatdagi
+    so'rovlarga tegilmaydi — ularni chat administratorlari o'zi ko'radi."""
     req = update.chat_join_request
-    record_join_request(req.chat.id, req.from_user.id)
+    channel = get_channel_by_chat_id(req.chat.id)
+    is_movie_channel = str(req.chat.id) == (get_setting("movie_channel_chatid") or "")
+    if not channel and not is_movie_channel:
+        return
+
+    try:
+        await context.bot.approve_chat_join_request(req.chat.id, req.from_user.id)
+    except TelegramError:
+        return
     try:
         await context.bot.send_message(
             req.from_user.id,
-            "✅ So'rovingiz qabul qilindi!\n\n🔎 Kino qidirish uchun qayta /start bosing."
+            "✅ So'rovingiz tekshirildi va tasdiqlandi!\n\n🔎 Kino qidirish uchun qayta /start bosing."
         )
     except TelegramError:
         pass
+
+
+# ============================== GURUH -> SUPERGROUP MIGRATSIYASI ==============================
+
+async def migration_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Oddiy guruh supergroupga aylanganda Telegram uning chat_id sini butunlay
+    o'zgartiradi. Bu holatda ro'yxatdagi (channels/pending_chats) eski ID ni
+    yangisiga avtomatik ko'chiramiz, aks holda guruh 'yo'qolib qoladi'."""
+    msg = update.message
+    if not msg:
+        return
+    old_id, new_id = None, None
+    if msg.migrate_to_chat_id:
+        old_id, new_id = msg.chat_id, msg.migrate_to_chat_id
+    elif msg.migrate_from_chat_id:
+        old_id, new_id = msg.migrate_from_chat_id, msg.chat_id
+    if not (old_id and new_id):
+        return
+
+    update_channel_chat_id(old_id, new_id)
+    if (get_setting("movie_channel_chatid") or "") == str(old_id):
+        set_setting("movie_channel_chatid", str(new_id))
+
+    for admin_id in get_admin_ids():
+        try:
+            await context.bot.send_message(
+                admin_id,
+                f"ℹ️ Guruh supergroupga aylandi, ID avtomatik yangilandi:\n"
+                f"`{old_id}` → `{new_id}`",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        except TelegramError:
+            pass
 
 
 # ============================== CALLBACK QUERY ROUTER ==============================
@@ -887,8 +894,8 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "check_sub":
         not_subs = await check_subscription(context, user.id)
         if not_subs:
-            await query.answer("❌ Siz hali barcha kanal/guruhlarga obuna bo'lmagansiz yoki "
-                                "maxfiy chatlarga so'rov yubormagansiz!", show_alert=True)
+            await query.answer("❌ Siz hali barcha kanal/guruhlarga obuna bo'lmagansiz yoki so'rovingiz "
+                                "hali tasdiqlanmagan!", show_alert=True)
             return
         await grant_referral_bonus_if_needed(context, get_user(user.id))
         await query.message.delete()
@@ -1014,8 +1021,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ---------- Quyidagilar faqat adminlar uchun ----------
-    if data.startswith(("admin_panel", "padd_", "uptype_", "upmode_", "chdel_", "admdel_",
-                         "balchg_", "codeconf_", "movdel_", "movdelall_")):
+    if data.startswith(("admin_panel", "padd_", "uptype_", "upmode_", "chdel_", "admdel_", "balchg_")):
         if not is_admin(user.id):
             await query.answer("⛔️ Sizda ruxsat yo'q.", show_alert=True)
             return
@@ -1055,41 +1061,54 @@ async def admin_callback_router(query, context: ContextTypes.DEFAULT_TYPE, data:
             return
 
         if action == "add":
-            if len(get_mandatory_channels()) >= MAX_MANDATORY_CHANNELS:
-                delete_pending_chat(chat_id)
-                await query.message.edit_text(
-                    f"⚠️ Siz allaqachon {MAX_MANDATORY_CHANNELS} ta kanal/guruh ulagansiz "
-                    f"(maksimal chegara). Yangisini qo'shish uchun avval birortasini "
-                    f"o'chiring (🔒 Majburiy obunalar bo'limidan)."
-                )
-                return
             if pending["username"]:
                 # Ommaviy — oddiy username havolasi yetarli
-                add_channel(chat_id, pending["username"], None, pending["title"], "public", pending["kind"])
+                add_channel(chat_id, pending["username"], None, pending["title"], "public", pending["kind"], pending["chat_type"])
                 delete_pending_chat(chat_id)
                 await query.message.edit_text(
                     f"✅ Ommaviy majburiy obunaga qo'shildi: {pending['title']}\n"
                     f"(Foydalanuvchilar to'g'ridan-to'g'ri qo'shiladi)"
                 )
             else:
-                # Maxfiy — join-request havolasi yaratamiz; BOT TASDIQLAMAYDI,
-                # faqat so'rov yuborilganini tekshiradi (check_subscription orqali)
+                # Maxfiy — join-request havolasi yaratamiz, so'rovlar avtomatik tasdiqlanadi
                 invite_link = None
                 try:
                     link_obj = await context.bot.create_chat_invite_link(chat_id, creates_join_request=True)
                     invite_link = link_obj.invite_link
                 except TelegramError as e:
-                    await query.message.edit_text(
-                        f"⚠️ Taklif havolasi yaratib bo'lmadi: {e}\n\n"
-                        "Bot bu chatda 'Foydalanuvchilarni taklif qilish' huquqiga ega ekanligini tekshiring."
-                    )
+                    retry_kb = InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🔄 Qayta urinish", callback_data=f"padd_add_{chat_id}")],
+                        [InlineKeyboardButton("❌ Bekor qilish", callback_data=f"padd_cancel_{chat_id}")],
+                    ])
+                    err_text = str(e).lower()
+                    if pending["kind"] == "group" and pending["chat_type"] == ChatType.GROUP:
+                        await query.message.edit_text(
+                            "⚠️ Taklif havolasi yaratib bo'lmadi, chunki bu — oddiy (eski turdagi) guruh.\n\n"
+                            "So'rov orqali qo'shilish (join request) faqat *supergroup* va kanallarda ishlaydi.\n\n"
+                            "✅ Yechim: guruh sozlamalaridan istalgan supergroup-only funksiyani yoqing "
+                            "(masalan \"Yangi a'zolarni tasdiqlash\"), guruh avtomatik supergroupga "
+                            "aylanadi, so'ng pastdagi tugmani qayta bosing.",
+                            reply_markup=retry_kb, parse_mode=ParseMode.MARKDOWN,
+                        )
+                    elif "administrator" in err_text or "right" in err_text or "not enough rights" in err_text:
+                        await query.message.edit_text(
+                            f"⚠️ Taklif havolasi yaratib bo'lmadi: {e}\n\n"
+                            "Botga shu chatda \"Foydalanuvchilarni taklif qilish\" (Invite Users via Link) "
+                            "admin huquqini bering, so'ng qayta urinib ko'ring.",
+                            reply_markup=retry_kb,
+                        )
+                    else:
+                        await query.message.edit_text(
+                            f"⚠️ Taklif havolasi yaratib bo'lmadi: {e}\n\n"
+                            "Bot bu chatda 'Foydalanuvchilarni taklif qilish' huquqiga ega ekanligini tekshiring.",
+                            reply_markup=retry_kb,
+                        )
                     return
-                add_channel(chat_id, None, invite_link, pending["title"], "private", pending["kind"])
+                add_channel(chat_id, None, invite_link, pending["title"], "private", pending["kind"], pending["chat_type"])
                 delete_pending_chat(chat_id)
                 await query.message.edit_text(
                     f"✅ Maxfiy majburiy obunaga qo'shildi: {pending['title']}\n"
-                    f"Foydalanuvchilar so'rov yuboradi — men buni QAYD qilaman "
-                    f"(o'zim tasdiqlamayman, haqiqiy tasdiqlashni siz o'zingiz qilasiz)."
+                    f"Foydalanuvchilar so'rov yuboradi, men tekshirib avtomatik tasdiqlayman."
                 )
             return
 
@@ -1105,43 +1124,11 @@ async def admin_callback_router(query, context: ContextTypes.DEFAULT_TYPE, data:
     if data.startswith("uptype_"):
         if data == "uptype_movie":
             context.user_data["new_movie"]["episode"] = 1
-            context.user_data["new_movie"]["is_series"] = 0
             context.user_data["state"] = "await_movie_file"
             await query.message.edit_text("🎥 Endi kino faylini (video yoki hujjat) yuboring:")
         else:
-            context.user_data["new_movie"]["is_series"] = 1
             context.user_data["state"] = "await_movie_episode"
             await query.message.edit_text("🔢 Nechanchi qism ekanini kiriting (masalan: 1):")
-        return
-
-    # ---- Mavjud serial kodiga yana qism qoshishni tasdiqlash ----
-    if data == "codeconf_yes":
-        context.user_data["new_movie"]["is_series"] = 1
-        mode = context.user_data["new_movie"].get("mode", "full")
-        if mode == "full":
-            context.user_data["state"] = "await_movie_title"
-            await query.message.edit_text("📌 Kino nomini kiriting:")
-        else:
-            context.user_data["state"] = "await_movie_episode"
-            await query.message.edit_text("🔢 Nechanchi qism ekanini kiriting:")
-        return
-
-    if data == "codeconf_no":
-        context.user_data["state"] = "await_movie_code"
-        await query.message.edit_text("🎬 Boshqa kino kodini kiriting:")
-        return
-
-    # ---- Kinoni o'chirish ----
-    if data.startswith("movdelall_"):
-        code = data.split("_", 1)[1]
-        delete_movies_by_code(code)
-        await query.message.edit_text(f"✅ '{code}' kodidagi barcha qismlar o'chirildi.")
-        return
-
-    if data.startswith("movdel_"):
-        movie_id = int(data.split("_", 1)[1])
-        delete_movie(movie_id)
-        await query.message.edit_text("✅ Kino o'chirildi.")
         return
 
     # ---- Kanal/guruhni ro'yxatdan o'chirish ----
@@ -1230,18 +1217,12 @@ async def show_payments_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
 # ============================== ADMIN MENYU (Reply Keyboard) ROUTERI ==============================
 
 async def admin_menu_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Reply-keyboard menyu bosilganda ishlaydi. True qaytarsa — xabar shu yerda ishlov olindi.
-
-    MUHIM: bu funksiya har bir tugma matnini GLOBAL (admin_level'dan MUSTAQIL) tarzda
-    taniydi. Ilgari faqat 'joriy daraja'ga mos matnlarni tekshirar edik — agar
-    admin_level biror sababdan (masalan, bot qayta ishga tushsa va xotiradagi
-    user_data tozalansa) yo'qolib qolsa, tugmalar umuman ishlamay qolar va matn
-    kino-kodi qidiruviga tushib ketardi. Endi har bir tugma o'zi mustaqil ishlaydi —
-    admin_level faqat QAYSI KLAVIATURA ko'rsatilishini aniqlash uchun ishlatiladi,
-    tugmani TANISH uchun emas.
-    """
+    """Reply-keyboard menyu bosilganda ishlaydi. True qaytarsa — xabar shu yerda ishlov olindi."""
     user = update.effective_user
     if not is_admin(user.id):
+        return False
+    level = context.user_data.get("admin_level")
+    if not level:
         return False
     text = update.message.text.strip()
 
@@ -1255,127 +1236,106 @@ async def admin_menu_text_handler(update: Update, context: ContextTypes.DEFAULT_
         await update.message.reply_text("🛠 Boshqaruv paneli", reply_markup=RK_MAIN)
         return True
 
-    if text == "📡 Kanallar":
-        context.user_data["admin_level"] = "channels"
-        await update.message.reply_text("📡 Kanallar / guruhlarni sozlash bo'limi", reply_markup=RK_CHANNELS)
-        return True
+    if level == "main":
+        if text == "📡 Kanallar":
+            context.user_data["admin_level"] = "channels"
+            await update.message.reply_text("📡 Kanallar / guruhlarni sozlash bo'limi", reply_markup=RK_CHANNELS)
+            return True
+        if text == "🎬 Kino yuklash":
+            context.user_data["new_movie"] = {}
+            await update.message.reply_text(
+                "📤 Qanday usulda yuklaymiz?\n\n"
+                "🖼 Rasm bilan — to'liq ma'lumot (nomi, janri, tili, davlati) so'raladi\n"
+                "🎞 Qisqa video bilan — tezkor, qo'shimcha ma'lumot so'ralmaydi",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🖼 Rasm bilan (to'liq)", callback_data="upmode_full")],
+                    [InlineKeyboardButton("🎞 Qisqa video bilan (tezkor)", callback_data="upmode_simple")],
+                ]),
+            )
+            return True
+        if text == "📢 Xabarnoma":
+            context.user_data["state"] = "await_broadcast"
+            await update.message.reply_text("📢 Barcha foydalanuvchilarga yuboriladigan xabar matnini kiriting:",
+                                             reply_markup=ReplyKeyboardRemove())
+            return True
+        if text == "📊 Statistika":
+            context.user_data["admin_level"] = "stats"
+            await update.message.reply_text("📊 Davrni tanlang:", reply_markup=RK_STATS)
+            return True
+        if text == "⚙️ Bot holati":
+            current = get_setting("bot_enabled")
+            status_text = "🟢 Yoqilgan" if current == "1" else "🔴 O'chirilgan"
+            context.user_data["admin_level"] = "status"
+            await update.message.reply_text(f"⚙️ Bot holati: {status_text}", reply_markup=rk_status())
+            return True
+        if text == "👮 Adminlar":
+            context.user_data["admin_level"] = "admins"
+            await update.message.reply_text("👮 Adminlar bo'limi", reply_markup=RK_ADMINS)
+            return True
+        if text == "💳 To'lovlar":
+            await show_payments_text(update, context)
+            return True
+        if text == "🔧 Sozlamalar":
+            context.user_data["admin_level"] = "settings"
+            await update.message.reply_text("🔧 Sozlamalar", reply_markup=RK_SETTINGS)
+            return True
+        if text == "🔎 Foydalanuvchini tekshirish":
+            context.user_data["state"] = "await_check_user"
+            await update.message.reply_text("🆔 Tekshirmoqchi bo'lgan foydalanuvchi ID sini kiriting:")
+            return True
 
-    if text == "🎬 Kino yuklash":
-        context.user_data["admin_level"] = "main"
-        context.user_data["new_movie"] = {}
-        await update.message.reply_text(
-            "📤 Qanday usulda yuklaymiz?\n\n"
-            "🖼 Rasm bilan — to'liq ma'lumot (nomi, janri, tili, davlati) so'raladi\n"
-            "🎞 Qisqa video bilan — tezkor, qo'shimcha ma'lumot so'ralmaydi",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🖼 Rasm bilan (to'liq)", callback_data="upmode_full")],
-                [InlineKeyboardButton("🎞 Qisqa video bilan (tezkor)", callback_data="upmode_simple")],
-            ]),
-        )
-        return True
+    elif level == "channels":
+        if text == "🔒 Majburiy obunalar":
+            await show_mandatory_list_text(update, context)
+            return True
+        if text == "🎥 Kino kanal":
+            movie_ch = get_setting("movie_channel_username")
+            cur = f"@{movie_ch}" if movie_ch else "ulanmagan ❌"
+            await update.message.reply_text(
+                f"🎥 Joriy kino kanali: {cur}\n\n"
+                "Yangi kanal ulash uchun: botni kerakli kanalga ADMIN qilib qo'shing — "
+                "men avtomatik aniqlab, tasdiqlash uchun xabar yuboraman "
+                "('🎬 Kino kanali qilish' tugmasi orqali)."
+            )
+            return True
 
-    if text == "🗑 Kino o'chirish":
-        context.user_data["admin_level"] = "main"
-        context.user_data["state"] = "await_delete_code"
-        await update.message.reply_text("🗑 O'chirmoqchi bo'lgan kino kodini kiriting:")
-        return True
+    elif level == "admins":
+        if text == "➕ Admin qo'shish":
+            context.user_data["state"] = "await_admin_add"
+            await update.message.reply_text("🆔 Yangi admin qilinadigan foydalanuvchi ID sini yuboring:")
+            return True
+        if text == "📋 Adminlar ro'yxati":
+            await show_admin_list_text(update, context)
+            return True
 
-    if text == "📢 Xabarnoma":
-        context.user_data["admin_level"] = "main"
-        context.user_data["state"] = "await_broadcast"
-        await update.message.reply_text("📢 Barcha foydalanuvchilarga yuboriladigan xabar matnini kiriting:",
-                                         reply_markup=ReplyKeyboardRemove())
-        return True
+    elif level == "settings":
+        mapping = {"👥 Referal narxi": "referral_bonus", "⭐ Premium narxi": "premium_price",
+                   "✨ Stars narxi": "stars_price"}
+        if text in mapping:
+            context.user_data["state"] = f"await_setting_{mapping[text]}"
+            await update.message.reply_text("✏️ Yangi qiymatni kiriting (raqam):")
+            return True
 
-    if text == "📊 Statistika":
-        context.user_data["admin_level"] = "stats"
-        await update.message.reply_text("📊 Davrni tanlang:", reply_markup=RK_STATS)
-        return True
+    elif level == "stats":
+        mapping = {"📅 Kunlik": "day", "🗓 Haftalik": "week", "📆 Oylik": "month"}
+        titles = {"day": "Kunlik", "week": "Haftalik", "month": "Oylik"}
+        if text in mapping:
+            kind = mapping[text]
+            breakdown = stats_breakdown(kind)
+            lines = [f"📊 {titles[kind]} statistika:\n"]
+            for label, users_c, downloads_c in breakdown:
+                lines.append(f"📅 {label}:\n   👥 Yangi foydalanuvchi: {users_c} ta\n   ⬇️ Yuklab olishlar: {downloads_c} ta\n")
+            await update.message.reply_text("\n".join(lines))
+            return True
 
-    if text == "⚙️ Bot holati":
-        current = get_setting("bot_enabled")
-        status_text = "🟢 Yoqilgan" if current == "1" else "🔴 O'chirilgan"
-        context.user_data["admin_level"] = "status"
-        await update.message.reply_text(f"⚙️ Bot holati: {status_text}", reply_markup=rk_status())
-        return True
-
-    if text == "👮 Adminlar":
-        context.user_data["admin_level"] = "admins"
-        await update.message.reply_text("👮 Adminlar bo'limi", reply_markup=RK_ADMINS)
-        return True
-
-    if text == "💳 To'lovlar":
-        context.user_data["admin_level"] = "main"
-        await show_payments_text(update, context)
-        return True
-
-    if text == "🔧 Sozlamalar":
-        context.user_data["admin_level"] = "settings"
-        await update.message.reply_text("🔧 Sozlamalar", reply_markup=RK_SETTINGS)
-        return True
-
-    if text == "🔎 Foydalanuvchini tekshirish":
-        context.user_data["admin_level"] = "main"
-        context.user_data["state"] = "await_check_user"
-        await update.message.reply_text("🆔 Tekshirmoqchi bo'lgan foydalanuvchi ID sini kiriting:")
-        return True
-
-    if text == "🔒 Majburiy obunalar":
-        context.user_data["admin_level"] = "channels"
-        await show_mandatory_list_text(update, context)
-        return True
-
-    if text == "🎥 Kino kanal":
-        context.user_data["admin_level"] = "channels"
-        movie_ch = get_setting("movie_channel_username")
-        cur = f"@{movie_ch}" if movie_ch else "ulanmagan ❌"
-        await update.message.reply_text(
-            f"🎥 Joriy kino kanali: {cur}\n\n"
-            "Yangi kanal ulash uchun: botni kerakli kanalga ADMIN qilib qo'shing — "
-            "men avtomatik aniqlab, tasdiqlash uchun xabar yuboraman "
-            "('🎬 Kino kanali qilish' tugmasi orqali)."
-        )
-        return True
-
-    if text == "➕ Admin qo'shish":
-        context.user_data["admin_level"] = "admins"
-        context.user_data["state"] = "await_admin_add"
-        await update.message.reply_text("🆔 Yangi admin qilinadigan foydalanuvchi ID sini yuboring:")
-        return True
-
-    if text == "📋 Adminlar ro'yxati":
-        context.user_data["admin_level"] = "admins"
-        await show_admin_list_text(update, context)
-        return True
-
-    settings_map = {"👥 Referal narxi": "referral_bonus", "⭐ Premium narxi": "premium_price",
-                     "✨ Stars narxi": "stars_price"}
-    if text in settings_map:
-        context.user_data["admin_level"] = "settings"
-        context.user_data["state"] = f"await_setting_{settings_map[text]}"
-        await update.message.reply_text("✏️ Yangi qiymatni kiriting (raqam):")
-        return True
-
-    stats_map = {"📅 Kunlik": "day", "🗓 Haftalik": "week", "📆 Oylik": "month"}
-    stats_titles = {"day": "Kunlik", "week": "Haftalik", "month": "Oylik"}
-    if text in stats_map:
-        context.user_data["admin_level"] = "stats"
-        kind = stats_map[text]
-        breakdown = stats_breakdown(kind)
-        lines = [f"📊 {stats_titles[kind]} statistika:\n"]
-        for label, users_c, downloads_c in breakdown:
-            lines.append(f"📅 {label}:\n   👥 Yangi foydalanuvchi: {users_c} ta\n   ⬇️ Yuklab olishlar: {downloads_c} ta\n")
-        await update.message.reply_text("\n".join(lines))
-        return True
-
-    if text in ("🔴 O'chirish", "🟢 Yoqish"):
-        context.user_data["admin_level"] = "status"
-        current = get_setting("bot_enabled")
-        set_setting("bot_enabled", "0" if current == "1" else "1")
-        new_current = get_setting("bot_enabled")
-        status_text = "🟢 Yoqilgan" if new_current == "1" else "🔴 O'chirilgan"
-        await update.message.reply_text(f"✅ Holat o'zgartirildi: {status_text}", reply_markup=rk_status())
-        return True
+    elif level == "status":
+        if text in ("🔴 O'chirish", "🟢 Yoqish"):
+            current = get_setting("bot_enabled")
+            set_setting("bot_enabled", "0" if current == "1" else "1")
+            new_current = get_setting("bot_enabled")
+            status_text = "🟢 Yoqilgan" if new_current == "1" else "🔴 O'chirilgan"
+            await update.message.reply_text(f"✅ Holat o'zgartirildi: {status_text}", reply_markup=rk_status())
+            return True
 
     return False
 
@@ -1391,14 +1351,6 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not state:
         handled = await admin_menu_text_handler(update, context)
         if handled:
-            return
-        if is_admin(user.id) and context.user_data.get("admin_level"):
-            # Admin "Boshqaruv paneli" ichida — bu yerda KINO QIDIRUV ISHLAMAYDI.
-            # Faqat menyu tugmalari yoki ⬅️ Chiqish orqali chiqish ishlaydi.
-            await update.message.reply_text(
-                "❓ Noma'lum buyruq. Pastdagi menyudan tanlang, yoki kino qidirish "
-                "uchun avval ⬅️ Chiqish tugmasini bosing."
-            )
             return
 
     # ---------- Sozlamalarni o'zgartirish ----------
@@ -1501,60 +1453,9 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
         return
 
-    # ---------- Kino o'chirish ----------
-    if state == "await_delete_code":
-        context.user_data.pop("state", None)
-        episodes = get_movies_by_code(text)
-        if not episodes:
-            await update.message.reply_text("❌ Bunday kodli kino topilmadi.",
-                                              reply_markup=current_admin_keyboard(context))
-            return
-        if len(episodes) == 1:
-            m = episodes[0]
-            title_display = m["title"] or f"Kod {text}"
-            await update.message.reply_text(
-                f"🎬 \"{title_display}\" (kod: {text}) — o'chirilsinmi?",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🗑 Ha, o'chirish", callback_data=f"movdel_{m['id']}")],
-                ]),
-            )
-        else:
-            rows = [
-                [InlineKeyboardButton(f"🗑 {m['episode']}-qism", callback_data=f"movdel_{m['id']}")]
-                for m in episodes
-            ]
-            rows.append([InlineKeyboardButton("🗑 Barcha qismlarni o'chirish", callback_data=f"movdelall_{text}")])
-            await update.message.reply_text(
-                f"Bu kodga {len(episodes)} ta qism bor. Qaysi birini o'chiramiz?",
-                reply_markup=InlineKeyboardMarkup(rows),
-            )
-        return
-
     # ---------- Kino yuklash: matnli qadamlar ----------
     if state == "await_movie_code":
-        existing = get_movies_by_code(text)
-        if existing and not existing[0]["is_series"]:
-            # Bu kod allaqachon ODDIY KINO uchun band — qayta ishlatib bo'lmaydi
-            await update.message.reply_text(
-                "❌ Bunday kodli kino allaqachon mavjud. Boshqa kod kiriting:"
-            )
-            return  # holat o'zgarmaydi, admin qaytadan kod kiritadi
-
         context.user_data["new_movie"]["code"] = text
-
-        if existing and existing[0]["is_series"]:
-            # Bu kodga serial qoyilgan — davom ettirishni tasdiqlash kerak
-            context.user_data.pop("state", None)
-            await update.message.reply_text(
-                f"⚠️ Bu kodga serial qo'yilgan (hozircha {len(existing)} qism bor).\n"
-                f"Shu kodga yana qism qo'shmoqchimisiz?",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("✅ Ha, qo'shish", callback_data="codeconf_yes")],
-                    [InlineKeyboardButton("❌ Yo'q, boshqa kod", callback_data="codeconf_no")],
-                ]),
-            )
-            return
-
         if context.user_data["new_movie"].get("mode") == "simple":
             # Qisqa video rejimi: qo'shimcha ma'lumot so'ralmaydi
             context.user_data.pop("state", None)
@@ -1591,11 +1492,6 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if state == "await_movie_country":
         context.user_data["new_movie"]["country"] = text
         context.user_data.pop("state", None)
-        if "is_series" in context.user_data["new_movie"]:
-            # Bu allaqachon malum edi (mavjud serialga qism qoshilyapti) — savol berilmaydi
-            context.user_data["state"] = "await_movie_episode"
-            await update.message.reply_text("🔢 Nechanchi qism ekanini kiriting:")
-            return
         await update.message.reply_text(
             "📺 Bu qanday kontent?",
             reply_markup=InlineKeyboardMarkup([
@@ -1614,13 +1510,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🎥 Endi kino faylini (video yoki hujjat) yuboring:")
         return
 
-    # ---------- Hech qanday holat mos kelmasa: FAQAT RAQAM bo'lsa kino kodi deb qaraladi ----------
-    if not text.isdigit():
-        await update.message.reply_text(
-            "❓ Men buni tushunmadim.\n\n🔎 Kino qidirish uchun kodini FAQAT RAQAM ko'rinishida yuboring (masalan: 1)."
-        )
-        return
-
+    # ---------- Hech qanday holat mos kelmasa — bu kino kodi deb qaraladi ----------
     not_subs = await check_subscription(context, user.id)
     if not_subs:
         context.user_data["pending_code"] = text
@@ -1718,24 +1608,6 @@ def main():
             "❌ BOT_TOKEN sozlanmagan! Fayl ichida yoki BOT_TOKEN environment variable orqali kiriting."
         )
 
-    # ---- Railway/baza diagnostikasi: bu loglar orqali muammoni darhol korish mumkin ----
-    on_railway = bool(os.environ.get("RAILWAY_ENVIRONMENT") or os.environ.get("RAILWAY_PROJECT_ID"))
-    if _railway_volume:
-        print(f"✅ Railway Volume aniqlandi: {_railway_volume}")
-        print(f"✅ Baza shu yerda saqlanadi (doimiy): {DB_PATH}")
-    elif os.environ.get("DB_PATH"):
-        print(f"✅ DB_PATH qo'lda belgilangan: {DB_PATH}")
-    elif on_railway:
-        print("⚠️⚠️⚠️  DIQQAT — MUAMMO TOPILDI  ⚠️⚠️⚠️")
-        print("⚠️ Siz Railway'da ishlayapsiz, LEKIN hech qanday Volume ulanmagan!")
-        print(f"⚠️ Baza vaqtinchalik joyda saqlanmoqda: {os.path.abspath(DB_PATH)}")
-        print("⚠️ HAR YANGI DEPLOY'DA bu fayl butunlay o'chib ketadi (kinolar, foydalanuvchilar — hammasi).")
-        print("⚠️ TUZATISH: Railway loyihangizda -> service -> Settings -> Volumes -> ")
-        print("⚠️            'New Volume' -> istalgan mount path (masalan /data) -> shu servisga ulang.")
-        print("⚠️ Volume ulangach, bu bot uni AVTOMATIK topadi (qo'shimcha sozlash shart emas).")
-    else:
-        print(f"📁 Baza fayli (lokal): {os.path.abspath(DB_PATH)}")
-
     init_db()
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
@@ -1749,6 +1621,7 @@ def main():
     app.add_handler(CallbackQueryHandler(callback_router))
     app.add_handler(ChatMemberHandler(my_chat_member_handler, ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_handler(ChatJoinRequestHandler(join_request_handler))
+    app.add_handler(MessageHandler(filters.StatusUpdate.MIGRATE, migration_handler))
     app.add_handler(MessageHandler(
         filters.ChatType.PRIVATE & (filters.PHOTO | filters.VIDEO | filters.Document.ALL), media_handler
     ))
