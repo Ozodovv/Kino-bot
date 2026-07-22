@@ -222,6 +222,16 @@ def init_db():
                 PRIMARY KEY (user_id, code)
             );
 
+            CREATE TABLE IF NOT EXISTS movie_reviews (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id     INTEGER,
+                code        TEXT,
+                day         TEXT,
+                review      TEXT,
+                created_at  TEXT,
+                UNIQUE(user_id, code, day)
+            );
+
             CREATE TABLE IF NOT EXISTS lucky_codes (
                 code        TEXT PRIMARY KEY,
                 reward      REAL,
@@ -487,6 +497,45 @@ def get_avg_rating(code: str):
         return (row["avg_r"], row["c"]) if row and row["c"] else (None, 0)
 
 
+# ---- Kino haqida fikr (izoh) — kunlik missiya uchun ----
+
+def add_review(user_id: int, code: str, day: str, review: str):
+    with closing(get_conn()) as conn, conn:
+        conn.execute(
+            "INSERT INTO movie_reviews (user_id, code, day, review, created_at) VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(user_id, code, day) DO UPDATE SET review=excluded.review, created_at=excluded.created_at",
+            (user_id, code, day, review, datetime.datetime.now().isoformat()),
+        )
+
+
+def has_reviewed_today(user_id: int, code: str, day: str) -> bool:
+    with closing(get_conn()) as conn:
+        row = conn.execute(
+            "SELECT 1 FROM movie_reviews WHERE user_id=? AND code=? AND day=?", (user_id, code, day)
+        ).fetchone()
+        return bool(row)
+
+
+def reviewed_movies_count_today(user_id: int, day: str) -> int:
+    with closing(get_conn()) as conn:
+        row = conn.execute(
+            "SELECT COUNT(DISTINCT code) c FROM movie_reviews WHERE user_id=? AND day=?", (user_id, day)
+        ).fetchone()
+        return row["c"] if row else 0
+
+
+def watched_movies_today(user_id: int, day: str):
+    """Bugun foydalanuvchi yuklab olgan (ko'rgan) kinolarning unikal kodlari."""
+    with closing(get_conn()) as conn:
+        rows = conn.execute(
+            "SELECT DISTINCT m.code, m.title FROM downloads_log dl "
+            "JOIN movies m ON m.id = dl.movie_id "
+            "WHERE dl.user_id=? AND dl.downloaded_at >= ?",
+            (user_id, day),
+        ).fetchall()
+        return rows
+
+
 # ============================== KINO STATISTIKASI ==============================
 
 def code_total_downloads(code: str) -> int:
@@ -742,7 +791,8 @@ def _today_str() -> str:
 
 
 DAILY_MISSIONS = [
-    {"key": "watch3", "text": "🎬 Bugun 3 ta kino ko'rish", "target": 3, "xp": 30, "bonus": 500},
+    {"key": "watch3", "text": "🎬 Bugun 3 ta kinoni to'liq ko'rib, har biri haqida fikr qoldirish",
+     "target": 3, "xp": 30, "bonus": 500},
     {"key": "refer1", "text": "👥 Bugun 1 ta do'st taklif qilish", "target": 1, "xp": 50, "bonus": 1000},
 ]
 
@@ -752,7 +802,7 @@ def _mission_progress_value(user_id: int, key: str) -> int:
     with closing(get_conn()) as conn:
         if key == "watch3":
             row = conn.execute(
-                "SELECT COUNT(*) c FROM downloads_log WHERE user_id=? AND downloaded_at >= ?",
+                "SELECT COUNT(DISTINCT code) c FROM movie_reviews WHERE user_id=? AND day=?",
                 (user_id, today),
             ).fetchone()
             return row["c"]
@@ -1439,6 +1489,7 @@ def kb_movie_card(code: str, user_id: int = None) -> InlineKeyboardMarkup:
         InlineKeyboardButton("🌟 Baholash", callback_data=f"rate_{code}"),
         InlineKeyboardButton("📊 Statistika", callback_data=f"mstat_{code}"),
     ])
+    rows.append([InlineKeyboardButton("✍️ Fikr qoldirish", callback_data=f"review_{code}")])
     rows.append([InlineKeyboardButton("📤 Challenge yuborish", callback_data=f"chal_{code}")])
     return InlineKeyboardMarkup(rows)
 
@@ -1586,6 +1637,20 @@ async def send_movie_episode(message, context: ContextTypes.DEFAULT_TYPE, movie,
     else:
         await context.bot.send_document(message.chat_id, movie["file_id"], caption=caption,
                                          reply_markup=kb, protect_content=protect)
+
+    # ---- Bugun 3 ta kino ko'rilgan bo'lsa, lekin missiya hali tugallanmagan bo'lsa
+    #      (ya'ni ular haqida hali fikr qoldirilmagan bo'lsa) — eslatma yuboramiz ----
+    today = _today_str()
+    if not _is_mission_completed(user_id, "watch3", today) and len(watched_movies_today(user_id, today)) == 3:
+        try:
+            await context.bot.send_message(
+                user_id,
+                "🎯 Bugun 3 ta kino ko'rdingiz!\n"
+                "Missiyani yakunlash uchun har biri haqida fikringizni yozib qoldiring "
+                "(kino ostidagi \"✍️ Fikr qoldirish\" tugmasi orqali)."
+            )
+        except TelegramError:
+            pass
 
 
 # ============================== AVTOMATIK KANAL/GURUH ANIQLASH ==============================
@@ -1894,7 +1959,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ---------- Kino qismlari ----------
     if data.startswith("ep_"):
-        _, code, ep = data.split("_", 2)
+        code, ep = data[len("ep_"):].rsplit("_", 1)
         movie = get_movie_episode(code, int(ep))
         if movie:
             await send_movie_episode(query.message, context, movie, user.id)
@@ -1903,7 +1968,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data.startswith("eppage_"):
-        _, code, page = data.split("_", 2)
+        code, page = data[len("eppage_"):].rsplit("_", 1)
         episodes = list(get_movies_by_code(code))
         await query.message.edit_reply_markup(reply_markup=kb_episodes(code, episodes, int(page)))
         return
@@ -1966,7 +2031,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ---------- Baholash ----------
     if data.startswith("ratepick_"):
-        _, code, stars = data.split("_", 2)
+        code, stars = data[len("ratepick_"):].rsplit("_", 1)
         rate_movie(user.id, code, int(stars))
         await query.answer(f"✅ Siz {stars} ⭐ baho berdingiz. Rahmat!", show_alert=True)
         return
@@ -1974,6 +2039,17 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("rate_"):
         code = data.split("_", 1)[1]
         await query.message.reply_text("🌟 Kinoga baho bering:", reply_markup=kb_rating(code))
+        return
+
+    # ---------- Fikr (izoh) qoldirish ----------
+    if data.startswith("review_"):
+        code = data[len("review_"):]
+        context.user_data["state"] = "await_review"
+        context.user_data["review_code"] = code
+        await query.answer()
+        await query.message.reply_text(
+            "✍️ Shu kino haqida fikringizni (kamida bir necha so'z) yozib yuboring:"
+        )
         return
 
     # ---------- Kino statistikasi ----------
@@ -2909,6 +2985,23 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["new_movie"]["episode"] = int(text)
         context.user_data["state"] = "await_movie_file"
         await update.message.reply_text("🎥 Endi kino faylini (video yoki hujjat) yuboring:")
+        return
+
+    # ---------- Kino haqida fikr (izoh) — kunlik missiya uchun ----------
+    if state == "await_review":
+        code = context.user_data.get("review_code")
+        context.user_data.pop("state", None)
+        context.user_data.pop("review_code", None)
+        if not code:
+            return
+        if len(text) < 3:
+            await update.message.reply_text("❌ Iltimos, kamida bir necha so'zdan iborat fikr yozing.")
+            context.user_data["state"] = "await_review"
+            context.user_data["review_code"] = code
+            return
+        add_review(user.id, code, _today_str(), text)
+        await update.message.reply_text("✅ Fikringiz uchun rahmat!")
+        await check_and_complete_missions(context, user.id)
         return
 
     # ---------- Hech qanday holat mos kelmasa: SMART SEARCH ----------
