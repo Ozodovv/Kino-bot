@@ -25,6 +25,8 @@ ISHGA TUSHIRISH:
 """
 
 import os
+import re
+import difflib
 import asyncio
 import logging
 import sqlite3
@@ -89,6 +91,13 @@ def _safe_add_column(conn, table, coldef):
         pass  # ustun allaqachon mavjud
 
 
+def with_conn_count(query: str, params: tuple) -> int:
+    """Bitta COUNT(*) natijasini qaytaruvchi qisqa yordamchi."""
+    with closing(get_conn()) as conn:
+        row = conn.execute(query, params).fetchone()
+        return row["c"] if row else 0
+
+
 def init_db():
     with closing(get_conn()) as conn, conn:
         conn.executescript(
@@ -100,7 +109,17 @@ def init_db():
                 balance         REAL DEFAULT 0,
                 ref_by          INTEGER,
                 ref_bonus_given INTEGER DEFAULT 0,
+                xp              INTEGER DEFAULT 0,
+                level           INTEGER DEFAULT 1,
                 joined_at       TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS mission_progress (
+                user_id     INTEGER,
+                mission_key TEXT,
+                day         TEXT,
+                completed   INTEGER DEFAULT 0,
+                PRIMARY KEY (user_id, mission_key, day)
             );
 
             CREATE TABLE IF NOT EXISTS movies (
@@ -171,10 +190,62 @@ def init_db():
                 value TEXT
             );
 
+            CREATE TABLE IF NOT EXISTS radar_requests (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id     INTEGER,
+                query       TEXT,
+                notified    INTEGER DEFAULT 0,
+                created_at  TEXT,
+                UNIQUE(user_id, query)
+            );
+
+            CREATE TABLE IF NOT EXISTS watch_later (
+                user_id     INTEGER,
+                code        TEXT,
+                added_at    TEXT,
+                PRIMARY KEY (user_id, code)
+            );
+
             CREATE INDEX IF NOT EXISTS idx_users_ref_by ON users(ref_by);
+            CREATE TABLE IF NOT EXISTS favorites (
+                user_id     INTEGER,
+                code        TEXT,
+                added_at    TEXT,
+                PRIMARY KEY (user_id, code)
+            );
+
+            CREATE TABLE IF NOT EXISTS ratings (
+                user_id     INTEGER,
+                code        TEXT,
+                stars       INTEGER,
+                rated_at    TEXT,
+                PRIMARY KEY (user_id, code)
+            );
+
+            CREATE TABLE IF NOT EXISTS lucky_codes (
+                code        TEXT PRIMARY KEY,
+                reward      REAL,
+                added_at    TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS lucky_code_claims (
+                user_id     INTEGER,
+                code        TEXT,
+                claimed_at  TEXT,
+                PRIMARY KEY (user_id, code)
+            );
+
+            CREATE TABLE IF NOT EXISTS secret_code_claims (
+                user_id     INTEGER,
+                day         TEXT,
+                claimed_at  TEXT,
+                PRIMARY KEY (user_id, day)
+            );
+
             CREATE INDEX IF NOT EXISTS idx_movies_code ON movies(code);
             CREATE INDEX IF NOT EXISTS idx_payment_status ON payment_requests(status);
             CREATE INDEX IF NOT EXISTS idx_downloads_log_at ON downloads_log(downloaded_at);
+            CREATE INDEX IF NOT EXISTS idx_radar_notified ON radar_requests(notified);
             """
         )
         # eski bazalar uchun xavfsiz migratsiya
@@ -182,6 +253,14 @@ def init_db():
         _safe_add_column(conn, "channels", "kind TEXT DEFAULT 'channel'")
         _safe_add_column(conn, "movies", "mode TEXT DEFAULT 'full'")
         _safe_add_column(conn, "movies", "is_series INTEGER DEFAULT 0")
+        _safe_add_column(conn, "users", "xp INTEGER DEFAULT 0")
+        _safe_add_column(conn, "users", "level INTEGER DEFAULT 1")
+        _safe_add_column(conn, "movies", "shares INTEGER DEFAULT 0")
+        _safe_add_column(conn, "users", "vip_forced INTEGER DEFAULT 0")
+        _safe_add_column(conn, "users", "streak_count INTEGER DEFAULT 0")
+        _safe_add_column(conn, "users", "last_active_date TEXT")
+        _safe_add_column(conn, "users", "streak_last_reward INTEGER DEFAULT 0")
+        _safe_add_column(conn, "users", "last_mystery_date TEXT")
 
         defaults = {
             "movie_channel_username": "",
@@ -190,6 +269,17 @@ def init_db():
             "premium_price": "50000",
             "stars_price": "20000",
             "bot_enabled": "1",
+            "xp_per_view": "5",
+            "xp_per_referral": "20",
+            "xp_level_step": "100",
+            "vip_threshold_referrals": "10",
+            "streak_reward_7": "1000",
+            "streak_reward_30": "5000",
+            "streak_reward_100": "20000",
+            "mystery_box_min": "200",
+            "mystery_box_max": "2000",
+            "secret_code_today": "",
+            "secret_code_reward": "1000",
         }
         for k, v in defaults.items():
             conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (k, v))
@@ -237,14 +327,544 @@ def ref_count(user_id: int) -> int:
         return row["c"] if row else 0
 
 
+# ============================== RADAR (KUTILAYOTGAN KINOLAR) ==============================
+
+def add_radar_request(user_id: int, query: str):
+    with closing(get_conn()) as conn, conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO radar_requests (user_id, query, notified, created_at) VALUES (?, ?, 0, ?)",
+            (user_id, query.strip(), datetime.datetime.now().isoformat()),
+        )
+
+
+def get_pending_radar_requests():
+    with closing(get_conn()) as conn:
+        return conn.execute("SELECT * FROM radar_requests WHERE notified=0").fetchall()
+
+
+def mark_radar_notified(request_id: int):
+    with closing(get_conn()) as conn, conn:
+        conn.execute("UPDATE radar_requests SET notified=1 WHERE id=?", (request_id,))
+
+
+def radar_stats():
+    """Har bir so'rov nechta marta so'ralganini ko'rsatadi (admin panel uchun)."""
+    with closing(get_conn()) as conn:
+        return conn.execute(
+            "SELECT query, COUNT(*) AS c FROM radar_requests WHERE notified=0 "
+            "GROUP BY query ORDER BY c DESC, MAX(created_at) DESC LIMIT 30"
+        ).fetchall()
+
+
+async def notify_radar_waiters(context: ContextTypes.DEFAULT_TYPE, title: str, code: str):
+    """Yangi kino/qism qo'shilganda, shu nomni kutayotgan foydalanuvchilarga xabar beradi."""
+    if not title:
+        return
+    title_l = title.strip().lower()
+    for req in get_pending_radar_requests():
+        q = (req["query"] or "").strip().lower()
+        if not q:
+            continue
+        matched = q in title_l or title_l in q or difflib.SequenceMatcher(None, q, title_l).ratio() >= 0.6
+        if not matched:
+            continue
+        try:
+            await context.bot.send_message(
+                req["user_id"],
+                f"🔔 Siz kutayotgan kino botga qo'shildi!\n\n🎬 {title}\n🎬 Kino kodi: {code}\n\n"
+                f"Yuklab olish uchun kodni yuboring: {code}",
+            )
+        except (Forbidden, TelegramError):
+            pass
+        mark_radar_notified(req["id"])
+
+
+# ============================== KEYIN KO'RAMAN (WATCH LATER) ==============================
+
+def add_watch_later(user_id: int, code: str):
+    with closing(get_conn()) as conn, conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO watch_later (user_id, code, added_at) VALUES (?, ?, ?)",
+            (user_id, code, datetime.datetime.now().isoformat()),
+        )
+
+
+def remove_watch_later(user_id: int, code: str):
+    with closing(get_conn()) as conn, conn:
+        conn.execute("DELETE FROM watch_later WHERE user_id=? AND code=?", (user_id, code))
+
+
+def is_in_watch_later(user_id: int, code: str) -> bool:
+    with closing(get_conn()) as conn:
+        row = conn.execute(
+            "SELECT 1 FROM watch_later WHERE user_id=? AND code=?", (user_id, code)
+        ).fetchone()
+        return row is not None
+
+
+def get_watch_later(user_id: int):
+    with closing(get_conn()) as conn:
+        return conn.execute(
+            "SELECT w.code, MAX(m.title) AS title FROM watch_later w "
+            "LEFT JOIN movies m ON m.code = w.code "
+            "WHERE w.user_id=? GROUP BY w.code ORDER BY MAX(w.added_at) DESC",
+            (user_id,),
+        ).fetchall()
+
+
+def watch_later_count(user_id: int) -> int:
+    with closing(get_conn()) as conn:
+        row = conn.execute("SELECT COUNT(*) AS c FROM watch_later WHERE user_id=?", (user_id,)).fetchone()
+        return row["c"] if row else 0
+
+
 def change_balance(user_id: int, delta: float):
     with closing(get_conn()) as conn, conn:
         conn.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (delta, user_id))
 
 
+# ============================== SEVIMLILAR (FAVORITES) ==============================
+
+def toggle_favorite(user_id: int, code: str) -> bool:
+    """True qaytarsa — qo'shildi, False qaytarsa — olib tashlandi."""
+    with closing(get_conn()) as conn, conn:
+        row = conn.execute("SELECT 1 FROM favorites WHERE user_id=? AND code=?", (user_id, code)).fetchone()
+        if row:
+            conn.execute("DELETE FROM favorites WHERE user_id=? AND code=?", (user_id, code))
+            return False
+        conn.execute(
+            "INSERT INTO favorites (user_id, code, added_at) VALUES (?, ?, ?)",
+            (user_id, code, datetime.datetime.now().isoformat()),
+        )
+        return True
+
+
+def is_favorite(user_id: int, code: str) -> bool:
+    with closing(get_conn()) as conn:
+        return conn.execute(
+            "SELECT 1 FROM favorites WHERE user_id=? AND code=?", (user_id, code)
+        ).fetchone() is not None
+
+
+def favorites_count_for_user(user_id: int) -> int:
+    with closing(get_conn()) as conn:
+        row = conn.execute("SELECT COUNT(*) c FROM favorites WHERE user_id=?", (user_id,)).fetchone()
+        return row["c"] if row else 0
+
+
+def favorites_count_for_code(code: str) -> int:
+    with closing(get_conn()) as conn:
+        row = conn.execute("SELECT COUNT(*) c FROM favorites WHERE code=?", (code,)).fetchone()
+        return row["c"] if row else 0
+
+
+def get_user_favorites(user_id: int):
+    with closing(get_conn()) as conn:
+        return conn.execute(
+            "SELECT f.code, MAX(m.title) AS title FROM favorites f "
+            "LEFT JOIN movies m ON m.code = f.code "
+            "WHERE f.user_id=? GROUP BY f.code ORDER BY MAX(f.added_at) DESC",
+            (user_id,),
+        ).fetchall()
+
+
+# ============================== BAHOLASH (RATING) ==============================
+
+def rate_movie(user_id: int, code: str, stars: int):
+    with closing(get_conn()) as conn, conn:
+        conn.execute(
+            "INSERT INTO ratings (user_id, code, stars, rated_at) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(user_id, code) DO UPDATE SET stars=excluded.stars, rated_at=excluded.rated_at",
+            (user_id, code, stars, datetime.datetime.now().isoformat()),
+        )
+
+
+def get_avg_rating(code: str):
+    with closing(get_conn()) as conn:
+        row = conn.execute(
+            "SELECT AVG(stars) AS avg_r, COUNT(*) AS c FROM ratings WHERE code=?", (code,)
+        ).fetchone()
+        return (row["avg_r"], row["c"]) if row and row["c"] else (None, 0)
+
+
+# ============================== KINO STATISTIKASI ==============================
+
+def code_total_downloads(code: str) -> int:
+    with closing(get_conn()) as conn:
+        row = conn.execute("SELECT COALESCE(SUM(downloads), 0) c FROM movies WHERE code=?", (code,)).fetchone()
+        return row["c"] if row else 0
+
+
+def code_total_views(code: str) -> int:
+    with closing(get_conn()) as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) c FROM downloads_log dl JOIN movies m ON m.id = dl.movie_id WHERE m.code=?", (code,)
+        ).fetchone()
+        return row["c"] if row else 0
+
+
+def increment_shares(code: str):
+    with closing(get_conn()) as conn, conn:
+        conn.execute("UPDATE movies SET shares = shares + 1 WHERE code=?", (code,))
+
+
+def code_total_shares(code: str) -> int:
+    with closing(get_conn()) as conn:
+        row = conn.execute("SELECT COALESCE(SUM(shares), 0) c FROM movies WHERE code=?", (code,)).fetchone()
+        return row["c"] if row else 0
+
+
+def movie_stats_text(code: str) -> str:
+    avg_r, rating_c = get_avg_rating(code)
+    rating_line = f"⭐ O'rtacha baho: {avg_r:.1f}/5 ({rating_c} ta baho)" if rating_c else "⭐ O'rtacha baho: hali baho yo'q"
+    return (
+        f"👁 Ko'rilganlar: {code_total_views(code)} ta\n"
+        f"⬇️ Yuklab olinganlar: {code_total_downloads(code)} ta\n"
+        f"{rating_line}\n"
+        f"❤️ Sevimlilar soni: {favorites_count_for_code(code)} ta\n"
+        f"📤 Ulashilganlar: {code_total_shares(code)} ta"
+    )
+
+
+# ============================== TARIX (WATCH HISTORY) ==============================
+
+def get_user_history(user_id: int, limit: int = 10):
+    with closing(get_conn()) as conn:
+        return conn.execute(
+            "SELECT m.code, m.title, dl.downloaded_at FROM downloads_log dl "
+            "JOIN movies m ON m.id = dl.movie_id WHERE dl.user_id=? "
+            "ORDER BY dl.downloaded_at DESC LIMIT ?",
+            (user_id, limit),
+        ).fetchall()
+
+
+# ============================== VIP HOLATI ==============================
+
+def is_vip(user_row) -> bool:
+    if user_row is None:
+        return False
+    if user_row["vip_forced"]:
+        return True
+    threshold = int(get_setting("vip_threshold_referrals") or 10)
+    return ref_count(user_row["user_id"]) >= threshold
+
+
+def set_vip_forced(user_id: int, value: bool):
+    with closing(get_conn()) as conn, conn:
+        conn.execute("UPDATE users SET vip_forced=? WHERE user_id=?", (1 if value else 0, user_id))
+
+
+# ============================== STREAK (KETMA-KET KIRISH) ==============================
+
+STREAK_MILESTONES = [(7, "streak_reward_7"), (30, "streak_reward_30"), (100, "streak_reward_100")]
+
+
+async def update_streak_and_reward(context: ContextTypes.DEFAULT_TYPE, user_id: int):
+    """Har kuni FAQAT bir marta (foydalanuvchi /start bosganda) chaqiriladi:
+    ketma-ket kirish kunini hisoblaydi va 7/30/100 kunlarda bonus beradi."""
+    u = get_user(user_id)
+    if u is None:
+        return
+    today = datetime.date.today()
+    last = u["last_active_date"]
+    if last == today.isoformat():
+        return  # bugun allaqachon hisoblangan
+    if last:
+        try:
+            last_date = datetime.date.fromisoformat(last)
+        except ValueError:
+            last_date = None
+    else:
+        last_date = None
+    if last_date and (today - last_date).days == 1:
+        new_streak = (u["streak_count"] or 0) + 1
+    else:
+        new_streak = 1
+    with closing(get_conn()) as conn, conn:
+        conn.execute(
+            "UPDATE users SET streak_count=?, last_active_date=? WHERE user_id=?",
+            (new_streak, today.isoformat(), user_id),
+        )
+    last_reward = u["streak_last_reward"] or 0
+    for milestone, setting_key in STREAK_MILESTONES:
+        if new_streak >= milestone > last_reward:
+            bonus = float(get_setting(setting_key) or 0)
+            change_balance(user_id, bonus)
+            with closing(get_conn()) as conn, conn:
+                conn.execute("UPDATE users SET streak_last_reward=? WHERE user_id=?", (milestone, user_id))
+            try:
+                await context.bot.send_message(
+                    user_id,
+                    f"🔥 {milestone} kunlik streak uchun tabriklaymiz!\n💰 Bonus: {bonus:.0f} so'm hisobingizga qo'shildi.",
+                )
+            except (Forbidden, TelegramError):
+                pass
+
+
+# ============================== SIRLI QUTI ==============================
+
+def can_open_mystery_box(user_id: int) -> bool:
+    u = get_user(user_id)
+    if u is None:
+        return False
+    return u["last_mystery_date"] != datetime.date.today().isoformat()
+
+
+def open_mystery_box(user_id: int) -> float:
+    import random
+    lo = float(get_setting("mystery_box_min") or 200)
+    hi = float(get_setting("mystery_box_max") or 2000)
+    reward = round(random.uniform(lo, hi), -2) or lo  # 100 ga yaqinlashtirish
+    change_balance(user_id, reward)
+    with closing(get_conn()) as conn, conn:
+        conn.execute(
+            "UPDATE users SET last_mystery_date=? WHERE user_id=?",
+            (datetime.date.today().isoformat(), user_id),
+        )
+    return reward
+
+
+# ============================== BUGUNGI MAXFIY KOD ==============================
+
+def has_claimed_secret_code_today(user_id: int) -> bool:
+    today = datetime.date.today().isoformat()
+    with closing(get_conn()) as conn:
+        return conn.execute(
+            "SELECT 1 FROM secret_code_claims WHERE user_id=? AND day=?", (user_id, today)
+        ).fetchone() is not None
+
+
+def claim_secret_code(user_id: int):
+    today = datetime.date.today().isoformat()
+    with closing(get_conn()) as conn, conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO secret_code_claims (user_id, day, claimed_at) VALUES (?, ?, ?)",
+            (user_id, today, datetime.datetime.now().isoformat()),
+        )
+
+
+# ============================== OMADLI KODLAR ==============================
+
+def set_lucky_code(code: str, reward: float):
+    with closing(get_conn()) as conn, conn:
+        conn.execute(
+            "INSERT INTO lucky_codes (code, reward, added_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(code) DO UPDATE SET reward=excluded.reward",
+            (code, reward, datetime.datetime.now().isoformat()),
+        )
+
+
+def get_lucky_code(code: str):
+    with closing(get_conn()) as conn:
+        return conn.execute("SELECT * FROM lucky_codes WHERE code=?", (code,)).fetchone()
+
+
+def remove_lucky_code(code: str):
+    with closing(get_conn()) as conn, conn:
+        conn.execute("DELETE FROM lucky_codes WHERE code=?", (code,))
+
+
+async def claim_lucky_code_if_needed(context: ContextTypes.DEFAULT_TYPE, user_id: int, code: str):
+    lucky = get_lucky_code(code)
+    if not lucky:
+        return
+    with closing(get_conn()) as conn:
+        already = conn.execute(
+            "SELECT 1 FROM lucky_code_claims WHERE user_id=? AND code=?", (user_id, code)
+        ).fetchone()
+    if already:
+        return
+    with closing(get_conn()) as conn, conn:
+        conn.execute(
+            "INSERT INTO lucky_code_claims (user_id, code, claimed_at) VALUES (?, ?, ?)",
+            (user_id, code, datetime.datetime.now().isoformat()),
+        )
+    change_balance(user_id, lucky["reward"])
+    try:
+        await context.bot.send_message(
+            user_id,
+            f"🍀 Tabriklaymiz! Siz OMADLI KODni topdingiz!\n💰 Bonus: {lucky['reward']:.0f} so'm hisobingizga qo'shildi.",
+        )
+    except (Forbidden, TelegramError):
+        pass
+
+
 def mark_ref_bonus_given(user_id: int):
     with closing(get_conn()) as conn, conn:
         conn.execute("UPDATE users SET ref_bonus_given=1 WHERE user_id=?", (user_id,))
+
+
+# ============================== XP / DARAJA (LEVEL) ==============================
+
+def level_for_xp(xp: int) -> int:
+    step = int(get_setting("xp_level_step") or 100)
+    if step <= 0:
+        step = 100
+    return xp // step + 1
+
+
+async def add_xp(context: ContextTypes.DEFAULT_TYPE, user_id: int, amount: int):
+    """Foydalanuvchiga XP qo'shadi, darajani qayta hisoblaydi va daraja
+    ko'tarilsa foydalanuvchiga xabar yuboradi."""
+    u = get_user(user_id)
+    if not u:
+        return
+    old_level = u["level"] or 1
+    new_xp = (u["xp"] or 0) + amount
+    new_level = level_for_xp(new_xp)
+    with closing(get_conn()) as conn, conn:
+        conn.execute("UPDATE users SET xp=?, level=? WHERE user_id=?", (new_xp, new_level, user_id))
+    if new_level > old_level:
+        try:
+            await context.bot.send_message(
+                user_id,
+                f"🎉 Tabriklaymiz! Siz {new_level}-darajaga chiqdingiz!\n✨ Jami XP: {new_xp}"
+            )
+        except TelegramError:
+            pass
+
+
+def xp_progress_text(xp: int, level: int) -> str:
+    step = int(get_setting("xp_level_step") or 100)
+    if step <= 0:
+        step = 100
+    current_floor = (level - 1) * step
+    next_floor = level * step
+    have = xp - current_floor
+    need = next_floor - current_floor
+    return f"{have}/{need} XP (keyingi daraja: {level + 1})"
+
+
+# ============================== KUNLIK MISSIYALAR ==============================
+
+def _today_str() -> str:
+    return datetime.date.today().isoformat()
+
+
+DAILY_MISSIONS = [
+    {"key": "watch3", "text": "🎬 Bugun 3 ta kino ko'rish", "target": 3, "xp": 30, "bonus": 500},
+    {"key": "refer1", "text": "👥 Bugun 1 ta do'st taklif qilish", "target": 1, "xp": 50, "bonus": 1000},
+]
+
+
+def _mission_progress_value(user_id: int, key: str) -> int:
+    today = _today_str()
+    with closing(get_conn()) as conn:
+        if key == "watch3":
+            row = conn.execute(
+                "SELECT COUNT(*) c FROM downloads_log WHERE user_id=? AND downloaded_at >= ?",
+                (user_id, today),
+            ).fetchone()
+            return row["c"]
+        if key == "refer1":
+            row = conn.execute(
+                "SELECT COUNT(*) c FROM users WHERE ref_by=? AND ref_bonus_given=1 AND joined_at >= ?",
+                (user_id, today),
+            ).fetchone()
+            return row["c"]
+    return 0
+
+
+def _is_mission_completed(user_id: int, key: str, day: str) -> bool:
+    with closing(get_conn()) as conn:
+        row = conn.execute(
+            "SELECT completed FROM mission_progress WHERE user_id=? AND mission_key=? AND day=?",
+            (user_id, key, day),
+        ).fetchone()
+        return bool(row and row["completed"])
+
+
+def _mark_mission_completed(user_id: int, key: str, day: str):
+    with closing(get_conn()) as conn, conn:
+        conn.execute(
+            "INSERT INTO mission_progress (user_id, mission_key, day, completed) VALUES (?,?,?,1) "
+            "ON CONFLICT(user_id, mission_key, day) DO UPDATE SET completed=1",
+            (user_id, key, day),
+        )
+
+
+async def check_and_complete_missions(context: ContextTypes.DEFAULT_TYPE, user_id: int):
+    """Har bir kunlik missiyani tekshiradi; yangi bajarilgan bo'lsa mukofot beradi."""
+    today = _today_str()
+    for m in DAILY_MISSIONS:
+        if _is_mission_completed(user_id, m["key"], today):
+            continue
+        progress = _mission_progress_value(user_id, m["key"])
+        if progress >= m["target"]:
+            _mark_mission_completed(user_id, m["key"], today)
+            change_balance(user_id, m["bonus"])
+            await add_xp(context, user_id, m["xp"])
+            try:
+                await context.bot.send_message(
+                    user_id,
+                    f"✅ Missiya bajarildi: {m['text']}\n"
+                    f"🎁 Mukofot: +{m['bonus']:.0f} so'm, +{m['xp']} XP"
+                )
+            except TelegramError:
+                pass
+
+
+def get_missions_status(user_id: int):
+    """Har bir missiya uchun (matn, progress, target, bajarilganmi) ro'yxati."""
+    today = _today_str()
+    result = []
+    for m in DAILY_MISSIONS:
+        progress = min(_mission_progress_value(user_id, m["key"]), m["target"])
+        completed = _is_mission_completed(user_id, m["key"], today)
+        result.append((m["text"], progress, m["target"], completed))
+    return result
+
+
+# ============================== LIGA (HAFTALIK REYTING) ==============================
+
+def _week_start_iso() -> str:
+    now = datetime.datetime.now()
+    monday = (now - datetime.timedelta(days=now.weekday())).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    return monday.isoformat()
+
+
+def liga_leaderboard(limit: int = 10):
+    """Bu haftaning reytingi: ko'rish(x1) + referal(x5) + missiya(x3) ballari bo'yicha."""
+    week_start = _week_start_iso()
+    with closing(get_conn()) as conn:
+        rows = conn.execute(
+            """
+            SELECT u.user_id, u.first_name,
+                COALESCE(v.views, 0) AS views,
+                COALESCE(r.refs, 0) AS refs,
+                COALESCE(mi.missions, 0) AS missions,
+                (COALESCE(v.views,0)*1 + COALESCE(r.refs,0)*5 + COALESCE(mi.missions,0)*3) AS score
+            FROM users u
+            LEFT JOIN (
+                SELECT user_id, COUNT(*) views FROM downloads_log
+                WHERE downloaded_at >= ? GROUP BY user_id
+            ) v ON v.user_id = u.user_id
+            LEFT JOIN (
+                SELECT ref_by AS user_id, COUNT(*) refs FROM users
+                WHERE ref_bonus_given=1 AND joined_at >= ? GROUP BY ref_by
+            ) r ON r.user_id = u.user_id
+            LEFT JOIN (
+                SELECT user_id, COUNT(*) missions FROM mission_progress
+                WHERE completed=1 AND day >= ? GROUP BY user_id
+            ) mi ON mi.user_id = u.user_id
+            WHERE score > 0
+            ORDER BY score DESC
+            LIMIT ?
+            """,
+            (week_start, week_start, week_start[:10], limit),
+        ).fetchall()
+    return rows
+
+
+def liga_user_rank(user_id: int):
+    """Foydalanuvchining bu haftadagi reytingdagi o'rni va balli. Topilmasa None."""
+    board = liga_leaderboard(limit=100000)
+    for i, row in enumerate(board, start=1):
+        if row["user_id"] == user_id:
+            return i, row["score"]
+    return None, 0
 
 
 def register_user_if_new(user_id, username, first_name, ref_by=None) -> bool:
@@ -346,6 +966,20 @@ def get_movie_episode(code: str, episode: int):
         return conn.execute(
             "SELECT * FROM movies WHERE code=? AND episode=?", (code, episode)
         ).fetchone()
+
+
+def get_random_movie():
+    with closing(get_conn()) as conn:
+        return conn.execute("SELECT * FROM movies ORDER BY RANDOM() LIMIT 1").fetchone()
+
+
+def get_all_movie_titles():
+    """Smart Search uchun: nomi bor barcha (kod, nom) juftliklari, har kod bittadan."""
+    with closing(get_conn()) as conn:
+        return conn.execute(
+            "SELECT DISTINCT code, title FROM movies WHERE title IS NOT NULL AND title != '' "
+            "GROUP BY code"
+        ).fetchall()
 
 
 def add_movie(code, episode, title, genre, language, country, file_id, file_type, mode="full", is_series=0):
@@ -528,7 +1162,10 @@ def kb_main_menu(user_id: int) -> InlineKeyboardMarkup:
         rows.append([InlineKeyboardButton("🎬 Kino kodlari", url=f"https://t.me/{movie_channel}")])
     else:
         rows.append([InlineKeyboardButton("🎬 Kino kodlari", callback_data="no_movie_channel")])
-    rows.append([InlineKeyboardButton("💰 Pul ishlash", callback_data="earn")])
+    rows.append([InlineKeyboardButton("🎲 Tasodifiy kino", callback_data="random_movie"),
+                 InlineKeyboardButton("🎁 Sirli quti", callback_data="mystery_box")])
+    rows.append([InlineKeyboardButton("👤 Profil", callback_data="profile"),
+                 InlineKeyboardButton("💰 Pul ishlash", callback_data="earn")])
     if is_admin(user_id):
         rows.append([InlineKeyboardButton("🛠 Boshqaruv paneli", callback_data="admin_panel")])
     return InlineKeyboardMarkup(rows)
@@ -569,7 +1206,14 @@ RK_MAIN = ReplyKeyboardMarkup([
     ["👮 Adminlar", "💳 To'lovlar"],
     ["🔧 Sozlamalar", "🔎 Foydalanuvchini tekshirish"],
     ["⚙️ Bot holati", "💾 Baza zaxirasi"],
+    ["📥 Kutilayotgan kinolar", "🎮 O'yin funksiyalari"],
     ["⬅️ Chiqish"],
+], resize_keyboard=True)
+
+RK_GAME = ReplyKeyboardMarkup([
+    ["🔑 Bugungi maxfiy kod", "🍀 Omadli kod belgilash"],
+    ["🍀 Omadli kodni bekor qilish", "👑 VIP berish/olish"],
+    ["⬅️ Orqaga"],
 ], resize_keyboard=True)
 
 RK_CHANNELS = ReplyKeyboardMarkup([
@@ -584,7 +1228,8 @@ RK_ADMINS = ReplyKeyboardMarkup([
 
 RK_SETTINGS = ReplyKeyboardMarkup([
     ["👥 Referal narxi", "⭐ Premium narxi"],
-    ["✨ Stars narxi"],
+    ["✨ Stars narxi", "🎬 XP (kino ko'rish)"],
+    ["👥 XP (referal)", "📶 XP (daraja bosqichi)"],
     ["⬅️ Orqaga"],
 ], resize_keyboard=True)
 
@@ -662,12 +1307,15 @@ async def grant_referral_bonus_if_needed(context: ContextTypes.DEFAULT_TYPE, use
     bonus = float(get_setting("referral_bonus") or 0)
     change_balance(referrer["user_id"], bonus)
     mark_ref_bonus_given(user_row["user_id"])
+    xp_amount = int(get_setting("xp_per_referral") or 20)
+    await add_xp(context, referrer["user_id"], xp_amount)
+    await check_and_complete_missions(context, referrer["user_id"])
     try:
         await context.bot.send_message(
             referrer["user_id"],
             "🎉 Sizning referal havolangiz orqali qo'shilgan foydalanuvchi majburiy "
             "kanal(lar)ga a'zo bo'ldi!\n"
-            f"💰 Hisobingizga {bonus:.0f} so'm qo'shildi."
+            f"💰 Hisobingizga {bonus:.0f} so'm qo'shildi. (+{xp_amount} XP)"
         )
     except TelegramError:
         pass
@@ -725,7 +1373,16 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ref_by = None
     if args:
         payload = args[0]
-        if payload.startswith("ref") and payload[3:].isdigit():
+        if payload.startswith("ref") and "_" in payload:
+            # Challenge orqali ulashilgan havola: ref<id>_<kino_kodi>
+            ref_part, _, code_part = payload.partition("_")
+            if ref_part[3:].isdigit():
+                candidate = int(ref_part[3:])
+                if candidate != user.id:
+                    ref_by = candidate
+            if code_part:
+                pending_code = code_part
+        elif payload.startswith("ref") and payload[3:].isdigit():
             candidate = int(payload[3:])
             if candidate != user.id:
                 ref_by = candidate
@@ -746,6 +1403,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await grant_referral_bonus_if_needed(context, get_user(user.id))
+    await update_streak_and_reward(context, user.id)
     await send_start_message(update, context, user)
 
     if pending_code:
@@ -762,14 +1420,32 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ============================== KINO QIDIRUV ==============================
 
-def kb_movie_card(code: str) -> InlineKeyboardMarkup:
+def kb_movie_card(code: str, user_id: int = None) -> InlineKeyboardMarkup:
     movie_channel = get_setting("movie_channel_username")
-    share_url = f"https://t.me/share/url?url=https://t.me/{BOT_USERNAME}?start={code}"
     rows = []
     if movie_channel:
         rows.append([InlineKeyboardButton("🎬 Ko'proq kinolar", url=f"https://t.me/{movie_channel}")])
-    rows.append([InlineKeyboardButton("↗️ Ulashish", url=share_url)])
+
+    in_wl = user_id is not None and is_in_watch_later(user_id, code)
+    wl_label = "✅ Ro'yxatda" if in_wl else "🔖 Keyin ko'raman"
+    in_fav = user_id is not None and is_favorite(user_id, code)
+    fav_label = "💔 Sevimlidan olish" if in_fav else "❤️ Sevimli"
+
+    rows.append([
+        InlineKeyboardButton(fav_label, callback_data=f"fav_{code}"),
+        InlineKeyboardButton(wl_label, callback_data=f"wl_{code}"),
+    ])
+    rows.append([
+        InlineKeyboardButton("🌟 Baholash", callback_data=f"rate_{code}"),
+        InlineKeyboardButton("📊 Statistika", callback_data=f"mstat_{code}"),
+    ])
+    rows.append([InlineKeyboardButton("📤 Challenge yuborish", callback_data=f"chal_{code}")])
     return InlineKeyboardMarkup(rows)
+
+
+def kb_rating(code: str) -> InlineKeyboardMarkup:
+    row = [InlineKeyboardButton("⭐" * n, callback_data=f"ratepick_{code}_{n}") for n in range(1, 6)]
+    return InlineKeyboardMarkup([row])
 
 
 def kb_episodes(code: str, episodes: list, page: int = 0, per_page: int = 10) -> InlineKeyboardMarkup:
@@ -793,6 +1469,71 @@ def kb_episodes(code: str, episodes: list, page: int = 0, per_page: int = 10) ->
     return InlineKeyboardMarkup(rows)
 
 
+
+# ============================== SMART SEARCH ==============================
+
+_CASUAL_PHRASES = {
+    "salom", "assalomu alaykum", "assalomu alekum", "alaykum assalom", "salomlar",
+    "hi", "hello", "hey", "qalaysan", "qalesan", "qandaysan", "qanaqasan",
+    "rahmat", "raxmat", "tashakkur", "xayr", "xayrli kun", "xayrli tun",
+    "ha", "yoq", "yo'q", "ok", "okay", "mayli", "bo'ldi", "boldi", "yaxshi",
+    "zor", "zo'r", "super", "admin", "bot", "botmisan", "kimsan", "kim san",
+    "test", "salom bot", "привет", "спасибо",
+}
+
+
+def looks_like_casual_text(text: str) -> bool:
+    """Salomlashish, minnatdorchilik, emoji va hokazo -- kino qidiruvi EMAS deb topadi."""
+    t = text.strip().lower()
+    if not t:
+        return True
+    if not re.search(r"[a-zA-Zа-яА-ЯёЁ0-9\u0400-\u04FF]", t):
+        return True  # faqat emoji/tinish belgilari
+    if t in _CASUAL_PHRASES:
+        return True
+    if len(t) <= 2:
+        return True
+    return False
+
+
+def smart_search_title(query: str):
+    """Kino nomi bo'yicha qidiradi (xato yozilgan nomlarni ham imkon qadar topadi).
+    Topilsa (kod, nom) qaytaradi, aks holda (None, None)."""
+    query_l = query.strip().lower()
+    rows = get_all_movie_titles()
+    if not rows:
+        return None, None
+
+    title_to_code = {r["title"]: r["code"] for r in rows}
+    titles = list(title_to_code.keys())
+
+    contains = [t for t in titles if query_l in t.lower()]
+    if contains:
+        contains.sort(key=len)
+        best = contains[0]
+        return title_to_code[best], best
+
+    lower_titles = [t.lower() for t in titles]
+    close = difflib.get_close_matches(query_l, lower_titles, n=1, cutoff=0.6)
+    if close:
+        for t in titles:
+            if t.lower() == close[0]:
+                return title_to_code[t], t
+
+    # 3) Ko'p so'zli nomlarda alohida so'zlar bo'yicha ham qidiramiz
+    #    (masalan "avenjers" -> "Avengers: Endgame" ichidagi "Avengers" so'ziga mos keladi)
+    best_match, best_ratio = None, 0.0
+    for t in titles:
+        for word in t.lower().replace(":", " ").replace(",", " ").split():
+            ratio = difflib.SequenceMatcher(None, query_l, word).ratio()
+            if ratio > best_ratio:
+                best_ratio, best_match = ratio, t
+    if best_match and best_ratio >= 0.72:
+        return title_to_code[best_match], best_match
+
+    return None, None
+
+
 async def process_movie_code(message, context: ContextTypes.DEFAULT_TYPE, code: str, user_id: int):
     episodes = get_movies_by_code(code)
     if not episodes:
@@ -813,6 +1554,10 @@ async def process_movie_code(message, context: ContextTypes.DEFAULT_TYPE, code: 
 async def send_movie_episode(message, context: ContextTypes.DEFAULT_TYPE, movie, user_id: int):
     record_download(movie["id"], user_id)
     increment_downloads(movie["id"])
+    xp_amount = int(get_setting("xp_per_view") or 5)
+    await add_xp(context, user_id, xp_amount)
+    await check_and_complete_missions(context, user_id)
+    await claim_lucky_code_if_needed(context, user_id, movie["code"])
 
     mode = movie["mode"] if movie["mode"] else "full"
     if mode == "simple":
@@ -833,7 +1578,7 @@ async def send_movie_episode(message, context: ContextTypes.DEFAULT_TYPE, movie,
             f"⬇️ Yuklanishlar soni: {movie['downloads'] + 1}"
         )
 
-    kb = kb_movie_card(movie["code"])
+    kb = kb_movie_card(movie["code"], user_id)
     protect = not is_admin(user_id)  # adminlar forward qila oladi, oddiy foydalanuvchilar yo'q
     if movie["file_type"] == "video":
         await context.bot.send_video(message.chat_id, movie["file_id"], caption=caption,
@@ -924,6 +1669,114 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "no_movie_channel":
         await query.answer("Hali kino kanali ulanmagan.", show_alert=True)
+        return
+
+    if data == "random_movie":
+        movie = get_random_movie()
+        if not movie:
+            await query.answer("😔 Hozircha botda kino yo'q.", show_alert=True)
+            return
+        not_subs = await check_subscription(context, user.id)
+        if not_subs:
+            await query.answer("⚠️ Avval majburiy kanal/guruhlarga obuna bo'ling.", show_alert=True)
+            return
+        await grant_referral_bonus_if_needed(context, get_user(user.id))
+        await send_movie_episode(query.message, context, movie, user.id)
+        return
+
+    if data == "mystery_box":
+        if not can_open_mystery_box(user.id):
+            await query.answer("📦 Siz bugun sirli qutini allaqachon ochingiz. Ertaga qayta urinib ko'ring!",
+                                show_alert=True)
+            return
+        reward = open_mystery_box(user.id)
+        await query.message.reply_text(
+            f"🎁 Sirli quti ochildi!\n💰 Siz {reward:.0f} so'm yutib oldingiz! Ertaga yana urinib ko'ring."
+        )
+        return
+
+    if data == "profile":
+        u = get_user(user.id)
+        views_c = with_conn_count("SELECT COUNT(*) c FROM downloads_log WHERE user_id=?", (user.id,))
+        rank, score = liga_user_rank(user.id)
+        rank_text = f"#{rank} (bu hafta {score} ball)" if rank else "hali reytingda yo'q"
+        vip_line = "👑 VIP: Ha" if is_vip(u) else "👑 VIP: Yo'q"
+        streak_line = f"🔥 Streak: {u['streak_count'] or 0} kun"
+        await query.message.edit_text(
+            "👤 Profil\n\n"
+            f"🆔 ID: `{user.id}`\n"
+            f"🏅 Daraja: {u['level']}\n"
+            f"✨ XP: {xp_progress_text(u['xp'], u['level'])}\n"
+            f"{vip_line}\n"
+            f"{streak_line}\n"
+            f"🏆 Liga o'rni: {rank_text}\n"
+            f"👁 Ko'rilgan kinolar: {views_c} ta\n"
+            f"❤️ Sevimlilar: {favorites_count_for_user(user.id)} ta\n"
+            f"👥 Referallar: {ref_count(user.id)} ta\n"
+            f"💳 Balans: {u['balance']:.0f} so'm",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🎯 Bugungi missiyalar", callback_data="missions")],
+                [InlineKeyboardButton("🏆 Liga (TOP-10)", callback_data="liga")],
+                [InlineKeyboardButton(f"🔖 Keyin ko'raman ({watch_later_count(user.id)})",
+                                       callback_data="watch_later_list"),
+                 InlineKeyboardButton(f"❤️ Sevimlilar ({favorites_count_for_user(user.id)})",
+                                       callback_data="favorites_list")],
+                [InlineKeyboardButton("🕘 Tarix", callback_data="history_list")],
+                [InlineKeyboardButton("⬅️ Orqaga", callback_data="back_start")],
+            ]),
+        )
+        return
+
+    if data == "favorites_list":
+        items = get_user_favorites(user.id)
+        if not items:
+            await query.answer("💔 Sevimlilar ro'yxati bo'sh.", show_alert=True)
+            return
+        rows = [
+            [InlineKeyboardButton(f"🎬 {r['title'] or r['code']}", callback_data=f"wlpick_{r['code']}")]
+            for r in items
+        ]
+        rows.append([InlineKeyboardButton("⬅️ Orqaga", callback_data="profile")])
+        await query.message.edit_text("❤️ Sevimlilar ro'yxati:", reply_markup=InlineKeyboardMarkup(rows))
+        return
+
+    if data == "history_list":
+        items = get_user_history(user.id, 15)
+        if not items:
+            await query.answer("🕘 Tarixingiz hozircha bo'sh.", show_alert=True)
+            return
+        lines = ["🕘 Ko'rilgan kinolar tarixi (oxirgi 15 ta):\n"]
+        for r in items:
+            when = (r["downloaded_at"] or "")[:16].replace("T", " ")
+            lines.append(f"🎬 {r['title'] or r['code']} — {when}")
+        await query.message.edit_text("\n".join(lines), reply_markup=kb_back("profile"))
+        return
+
+    if data == "missions":
+        statuses = get_missions_status(user.id)
+        lines = ["🎯 Bugungi missiyalar:\n"]
+        for text_m, progress, target, completed in statuses:
+            mark = "✅" if completed else f"{progress}/{target}"
+            lines.append(f"{'✅' if completed else '⏳'} {text_m} — {mark}")
+        await query.message.edit_text("\n".join(lines), reply_markup=kb_back("profile"))
+        return
+
+    if data == "liga":
+        board = liga_leaderboard(10)
+        if not board:
+            text = "🏆 Liga\n\nBu hafta hali hech kim ball to'plamagan."
+        else:
+            lines = ["🏆 Liga — bu haftaning TOP-10 si:\n"]
+            medals = ["🥇", "🥈", "🥉"]
+            for i, row in enumerate(board):
+                medal = medals[i] if i < 3 else f"{i+1}."
+                lines.append(f"{medal} {row['first_name'] or row['user_id']} — {row['score']} ball")
+            rank, score = liga_user_rank(user.id)
+            if rank and rank > 10:
+                lines.append(f"\n... sizning o'rningiz: #{rank} ({score} ball)")
+            text = "\n".join(lines)
+        await query.message.edit_text(text, reply_markup=kb_back("profile"))
         return
 
     if data == "check_sub":
@@ -1053,6 +1906,97 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _, code, page = data.split("_", 2)
         episodes = list(get_movies_by_code(code))
         await query.message.edit_reply_markup(reply_markup=kb_episodes(code, episodes, int(page)))
+        return
+
+    # ---------- Keyin ko'raman ----------
+    if data.startswith("wl_"):
+        code = data.split("_", 1)[1]
+        if is_in_watch_later(user.id, code):
+            remove_watch_later(user.id, code)
+            await query.answer("❌ Ro'yxatdan olib tashlandi.")
+        else:
+            add_watch_later(user.id, code)
+            await query.answer("🔖 'Keyin ko'raman' ro'yxatiga qo'shildi!")
+        try:
+            await query.message.edit_reply_markup(reply_markup=kb_movie_card(code, user.id))
+        except TelegramError:
+            pass
+        return
+
+    if data == "watch_later_list":
+        items = get_watch_later(user.id)
+        if not items:
+            await query.answer("📭 Ro'yxatingiz hozircha bo'sh.", show_alert=True)
+            return
+        rows = [
+            [InlineKeyboardButton(f"🎬 {r['title'] or r['code']}", callback_data=f"wlpick_{r['code']}")]
+            for r in items
+        ]
+        rows.append([InlineKeyboardButton("⬅️ Orqaga", callback_data="profile")])
+        await query.message.edit_text("🔖 Keyin ko'raman ro'yxati:", reply_markup=InlineKeyboardMarkup(rows))
+        return
+
+    if data.startswith("wlpick_"):
+        code = data.split("_", 1)[1]
+        await process_movie_code(query.message, context, code, user.id)
+        return
+
+    # ---------- Radar: kutilayotgan kino ----------
+    if data == "radar_add":
+        query_text = context.user_data.pop("last_search_query", None)
+        if not query_text:
+            await query.answer("⚠️ Amal muddati tugagan, qaytadan qidiring.", show_alert=True)
+            return
+        add_radar_request(user.id, query_text)
+        await query.message.edit_text(
+            f"🔔 Ajoyib! \"{query_text}\" nomli kino botga qo'shilganda sizga avtomatik xabar beramiz."
+        )
+        return
+
+    # ---------- Sevimlilar ----------
+    if data.startswith("fav_"):
+        code = data.split("_", 1)[1]
+        added = toggle_favorite(user.id, code)
+        await query.answer("❤️ Sevimlilarga qo'shildi!" if added else "💔 Sevimlilardan olib tashlandi.")
+        try:
+            await query.message.edit_reply_markup(reply_markup=kb_movie_card(code, user.id))
+        except TelegramError:
+            pass
+        return
+
+    # ---------- Baholash ----------
+    if data.startswith("ratepick_"):
+        _, code, stars = data.split("_", 2)
+        rate_movie(user.id, code, int(stars))
+        await query.answer(f"✅ Siz {stars} ⭐ baho berdingiz. Rahmat!", show_alert=True)
+        return
+
+    if data.startswith("rate_"):
+        code = data.split("_", 1)[1]
+        await query.message.reply_text("🌟 Kinoga baho bering:", reply_markup=kb_rating(code))
+        return
+
+    # ---------- Kino statistikasi ----------
+    if data.startswith("mstat_"):
+        code = data.split("_", 1)[1]
+        await query.answer()
+        await query.message.reply_text(f"📊 Statistika:\n\n{movie_stats_text(code)}")
+        return
+
+    # ---------- Kino Challenge (ulashish) ----------
+    if data.startswith("chal_"):
+        code = data.split("_", 1)[1]
+        increment_shares(code)
+        share_text = urllib.parse.quote("Men bu kinoni ko'rdim. Sen ham ko'rib baho ber! 🎬")
+        share_url = (
+            f"https://t.me/share/url?url=https://t.me/{BOT_USERNAME}?start=ref{user.id}_{code}"
+            f"&text={share_text}"
+        )
+        await query.answer()
+        await query.message.reply_text(
+            "📤 Do'stlaringizga ulashing:",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("↗️ Ulashish", url=share_url)]]),
+        )
         return
 
     # ---------- Quyidagilar faqat adminlar uchun ----------
@@ -1490,6 +2434,51 @@ async def admin_menu_text_handler(update: Update, context: ContextTypes.DEFAULT_
         await send_db_backup(update.message, context)
         return True
 
+    if text == "📥 Kutilayotgan kinolar":
+        context.user_data["admin_level"] = "main"
+        rows = radar_stats()
+        if not rows:
+            await update.message.reply_text("📥 Hozircha hech kim kino kutmayapti.")
+        else:
+            lines = ["📥 Kutilayotgan kinolar (nechta foydalanuvchi so'ragan):\n"]
+            for r in rows:
+                lines.append(f"• \"{r['query']}\" — {r['c']} kishi")
+            await update.message.reply_text("\n".join(lines))
+        return True
+
+    if text == "🎮 O'yin funksiyalari":
+        context.user_data["admin_level"] = "game"
+        current_secret = get_setting("secret_code_today") or "(o'rnatilmagan)"
+        await update.message.reply_text(
+            f"🎮 O'yin funksiyalari\n\n🔑 Joriy maxfiy kod: {current_secret}",
+            reply_markup=RK_GAME,
+        )
+        return True
+
+    if text == "🔑 Bugungi maxfiy kod":
+        context.user_data["admin_level"] = "game"
+        context.user_data["state"] = "await_secret_code_input"
+        await update.message.reply_text("🔑 Bugungi yangi maxfiy kodni kiriting (masalan: KINOBOT2026):")
+        return True
+
+    if text == "🍀 Omadli kod belgilash":
+        context.user_data["admin_level"] = "game"
+        context.user_data["state"] = "await_lucky_code_input"
+        await update.message.reply_text("🍀 Omadli kod qilib belgilamoqchi bo'lgan kino kodini kiriting:")
+        return True
+
+    if text == "🍀 Omadli kodni bekor qilish":
+        context.user_data["admin_level"] = "game"
+        context.user_data["state"] = "await_lucky_code_remove"
+        await update.message.reply_text("🍀 Omadli kod ro'yxatidan olib tashlanadigan kino kodini kiriting:")
+        return True
+
+    if text == "👑 VIP berish/olish":
+        context.user_data["admin_level"] = "game"
+        context.user_data["state"] = "await_vip_toggle_userid"
+        await update.message.reply_text("👑 VIP holatini o'zgartirmoqchi bo'lgan foydalanuvchi ID sini kiriting:")
+        return True
+
     if text == "⚙️ Bot holati":
         current = get_setting("bot_enabled")
         status_text = "🟢 Yoqilgan" if current == "1" else "🔴 O'chirilgan"
@@ -1547,7 +2536,8 @@ async def admin_menu_text_handler(update: Update, context: ContextTypes.DEFAULT_
         return True
 
     settings_map = {"👥 Referal narxi": "referral_bonus", "⭐ Premium narxi": "premium_price",
-                     "✨ Stars narxi": "stars_price"}
+                     "✨ Stars narxi": "stars_price", "🎬 XP (kino ko'rish)": "xp_per_view",
+                     "👥 XP (referal)": "xp_per_referral", "📶 XP (daraja bosqichi)": "xp_level_step"}
     if text in settings_map:
         context.user_data["admin_level"] = "settings"
         context.user_data["state"] = f"await_setting_{settings_map[text]}"
@@ -1754,6 +2744,60 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # ---------- O'yin funksiyalari (maxfiy kod / omadli kod / VIP) ----------
+    if state == "await_secret_code_input":
+        context.user_data.pop("state", None)
+        set_setting("secret_code_today", text.strip())
+        await update.message.reply_text(f"✅ Bugungi maxfiy kod o'rnatildi: {text.strip()}", reply_markup=RK_GAME)
+        return
+
+    if state == "await_lucky_code_input":
+        episodes = get_movies_by_code(text.strip())
+        if not episodes:
+            await update.message.reply_text("❌ Bunday kodli kino topilmadi. Qaytadan urinib ko'ring yoki /orqaga.")
+            return
+        context.user_data["lucky_code_pending"] = text.strip()
+        context.user_data["state"] = "await_lucky_code_reward"
+        await update.message.reply_text("💰 Bu kodni topganlarga qancha bonus berilsin (so'm)?")
+        return
+
+    if state == "await_lucky_code_reward":
+        if not text.replace(".", "", 1).isdigit():
+            await update.message.reply_text("❌ Faqat raqam kiriting.")
+            return
+        code = context.user_data.pop("lucky_code_pending", None)
+        context.user_data.pop("state", None)
+        if code:
+            set_lucky_code(code, float(text))
+            await update.message.reply_text(
+                f"🍀 \"{code}\" endi OMADLI KOD! Uni ochgan foydalanuvchi {float(text):.0f} so'm yutadi.",
+                reply_markup=RK_GAME,
+            )
+        return
+
+    if state == "await_lucky_code_remove":
+        context.user_data.pop("state", None)
+        remove_lucky_code(text.strip())
+        await update.message.reply_text(f"✅ \"{text.strip()}\" omadli kodlar ro'yxatidan olib tashlandi.",
+                                         reply_markup=RK_GAME)
+        return
+
+    if state == "await_vip_toggle_userid":
+        context.user_data.pop("state", None)
+        if not text.strip().isdigit():
+            await update.message.reply_text("❌ Faqat foydalanuvchi ID (raqam) kiriting.", reply_markup=RK_GAME)
+            return
+        target_id = int(text.strip())
+        target = get_user(target_id)
+        if not target:
+            await update.message.reply_text("❌ Bunday foydalanuvchi topilmadi.", reply_markup=RK_GAME)
+            return
+        new_state = not bool(target["vip_forced"])
+        set_vip_forced(target_id, new_state)
+        status = "✅ VIP berildi" if new_state else "❌ VIP olib tashlandi"
+        await update.message.reply_text(f"{status}: foydalanuvchi {target_id}", reply_markup=RK_GAME)
+        return
+
     # ---------- Kino o'chirish ----------
     if state == "await_delete_code":
         context.user_data.pop("state", None)
@@ -1867,11 +2911,24 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🎥 Endi kino faylini (video yoki hujjat) yuboring:")
         return
 
-    # ---------- Hech qanday holat mos kelmasa: FAQAT RAQAM bo'lsa kino kodi deb qaraladi ----------
-    if not text.isdigit():
-        await update.message.reply_text(
-            "❓ Men buni tushunmadim.\n\n🔎 Kino qidirish uchun kodini FAQAT RAQAM ko'rinishida yuboring (masalan: 1)."
-        )
+    # ---------- Hech qanday holat mos kelmasa: SMART SEARCH ----------
+    # 0) Bugungi maxfiy kod (agar admin belgilagan bo'lsa va hali bugun olmagan bo'lsa)
+    secret_today = get_setting("secret_code_today")
+    if secret_today and text.strip().lower() == secret_today.strip().lower():
+        if has_claimed_secret_code_today(user.id):
+            await update.message.reply_text("✅ Siz bugungi maxfiy kod bonusini allaqachon oldingiz.")
+        else:
+            reward = float(get_setting("secret_code_reward") or 0)
+            change_balance(user.id, reward)
+            claim_secret_code(user.id)
+            await update.message.reply_text(
+                f"🎁 Tabriklaymiz! Bu bugungi MAXFIY KOD edi!\n💰 Bonus: {reward:.0f} so'm hisobingizga qo'shildi."
+            )
+        return
+
+    # 1) Salomlashish/minnatdorchilik/emoji kabi "tasodifiy" matnlarni kino deb hisoblamaymiz
+    if looks_like_casual_text(text):
+        await update.message.reply_text("Kino kodi yoki kino nomini yuboring.")
         return
 
     not_subs = await check_subscription(context, user.id)
@@ -1883,7 +2940,25 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     await grant_referral_bonus_if_needed(context, get_user(user.id))
-    await process_movie_code(update.message, context, text, user.id)
+
+    if text.isdigit():
+        # 2) Raqam -> kino kodi sifatida qidiriladi
+        await process_movie_code(update.message, context, text, user.id)
+    else:
+        # 3) Raqam emas -> Smart Search (kino nomi bo'yicha, xato yozilgan bo'lsa ham)
+        code, matched_title = smart_search_title(text)
+        if code:
+            await update.message.reply_text(f"🔎 Topildi: \"{matched_title}\"")
+            await process_movie_code(update.message, context, code, user.id)
+        else:
+            context.user_data["last_search_query"] = text.strip()
+            await update.message.reply_text(
+                "❌ Bunday nomli kino topilmadi.\n\n"
+                "🔎 Boshqa nom bilan urinib ko'ring yoki aniq kino kodini yuboring.",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("🔔 Qo'shilganda xabar berish", callback_data="radar_add")]]
+                ),
+            )
 
 
 async def finish_or_continue_series(msg, context: ContextTypes.DEFAULT_TYPE, posted_to_channel: bool = True):
@@ -1928,6 +3003,7 @@ async def media_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         add_movie(nm["code"], nm["episode"], nm.get("title", ""), nm.get("genre", ""),
                    nm.get("language", ""), nm.get("country", ""), file_id, file_type, mode,
                    nm.get("is_series", 0))
+        await notify_radar_waiters(context, nm.get("title", ""), nm["code"])
 
         # Serial bo'lsa, kanalga FAQAT 1-qismda xabar yuboriladi (poster/teaser bilan).
         # Keyingi qismlar (2, 3, 4...) uchun kanalga qayta post qilinmaydi — foydalanuvchi
