@@ -222,16 +222,6 @@ def init_db():
                 PRIMARY KEY (user_id, code)
             );
 
-            CREATE TABLE IF NOT EXISTS movie_reviews (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id     INTEGER,
-                code        TEXT,
-                day         TEXT,
-                review      TEXT,
-                created_at  TEXT,
-                UNIQUE(user_id, code, day)
-            );
-
             CREATE TABLE IF NOT EXISTS lucky_codes (
                 code        TEXT PRIMARY KEY,
                 reward      REAL,
@@ -497,45 +487,6 @@ def get_avg_rating(code: str):
         return (row["avg_r"], row["c"]) if row and row["c"] else (None, 0)
 
 
-# ---- Kino haqida fikr (izoh) — kunlik missiya uchun ----
-
-def add_review(user_id: int, code: str, day: str, review: str):
-    with closing(get_conn()) as conn, conn:
-        conn.execute(
-            "INSERT INTO movie_reviews (user_id, code, day, review, created_at) VALUES (?, ?, ?, ?, ?) "
-            "ON CONFLICT(user_id, code, day) DO UPDATE SET review=excluded.review, created_at=excluded.created_at",
-            (user_id, code, day, review, datetime.datetime.now().isoformat()),
-        )
-
-
-def has_reviewed_today(user_id: int, code: str, day: str) -> bool:
-    with closing(get_conn()) as conn:
-        row = conn.execute(
-            "SELECT 1 FROM movie_reviews WHERE user_id=? AND code=? AND day=?", (user_id, code, day)
-        ).fetchone()
-        return bool(row)
-
-
-def reviewed_movies_count_today(user_id: int, day: str) -> int:
-    with closing(get_conn()) as conn:
-        row = conn.execute(
-            "SELECT COUNT(DISTINCT code) c FROM movie_reviews WHERE user_id=? AND day=?", (user_id, day)
-        ).fetchone()
-        return row["c"] if row else 0
-
-
-def watched_movies_today(user_id: int, day: str):
-    """Bugun foydalanuvchi yuklab olgan (ko'rgan) kinolarning unikal kodlari."""
-    with closing(get_conn()) as conn:
-        rows = conn.execute(
-            "SELECT DISTINCT m.code, m.title FROM downloads_log dl "
-            "JOIN movies m ON m.id = dl.movie_id "
-            "WHERE dl.user_id=? AND dl.downloaded_at >= ?",
-            (user_id, day),
-        ).fetchall()
-        return rows
-
-
 # ============================== KINO STATISTIKASI ==============================
 
 def code_total_downloads(code: str) -> int:
@@ -791,8 +742,7 @@ def _today_str() -> str:
 
 
 DAILY_MISSIONS = [
-    {"key": "watch3", "text": "🎬 Bugun 3 ta kinoni to'liq ko'rib, har biri haqida fikr qoldirish",
-     "target": 3, "xp": 30, "bonus": 500},
+    {"key": "watch3", "text": "🎬 Bugun 3 ta kino ko'rish", "target": 3, "xp": 30, "bonus": 500},
     {"key": "refer1", "text": "👥 Bugun 1 ta do'st taklif qilish", "target": 1, "xp": 50, "bonus": 1000},
 ]
 
@@ -802,7 +752,7 @@ def _mission_progress_value(user_id: int, key: str) -> int:
     with closing(get_conn()) as conn:
         if key == "watch3":
             row = conn.execute(
-                "SELECT COUNT(DISTINCT code) c FROM movie_reviews WHERE user_id=? AND day=?",
+                "SELECT COUNT(*) c FROM downloads_log WHERE user_id=? AND downloaded_at >= ?",
                 (user_id, today),
             ).fetchone()
             return row["c"]
@@ -1392,6 +1342,27 @@ async def notify_admins_new_user(context: ContextTypes.DEFAULT_TYPE, user):
             pass
 
 
+async def notify_admins_movie_not_found(context: ContextTypes.DEFAULT_TYPE, user_id: int, query_text: str):
+    """Foydalanuvchi qidirgan kino (kod yoki nom) topilmasa, adminlarga darhol xabar beriladi —
+    shunda talab yuqori kinolarni tezroq qo'shish mumkin bo'ladi."""
+    u = get_user(user_id)
+    name = u["first_name"] if u and u["first_name"] else "-"
+    username = u["username"] if u else None
+    tg_line = f"🔗 @{username}\n" if username else ""
+    text = (
+        "🔎 Foydalanuvchi kino qidirdi, lekin topilmadi!\n\n"
+        f"👤 {name}\n"
+        f"🆔 ID: `{user_id}`\n"
+        + tg_line +
+        f"📝 So'rov: \"{query_text}\""
+    )
+    for admin_id in get_admin_ids():
+        try:
+            await context.bot.send_message(admin_id, text, parse_mode=ParseMode.MARKDOWN)
+        except TelegramError:
+            pass
+
+
 async def send_start_message(update_or_query, context: ContextTypes.DEFAULT_TYPE, user):
     text = (
         f"🖐 Assalomu alaykum, {user.first_name}!\n\n"
@@ -1489,7 +1460,6 @@ def kb_movie_card(code: str, user_id: int = None) -> InlineKeyboardMarkup:
         InlineKeyboardButton("🌟 Baholash", callback_data=f"rate_{code}"),
         InlineKeyboardButton("📊 Statistika", callback_data=f"mstat_{code}"),
     ])
-    rows.append([InlineKeyboardButton("✍️ Fikr qoldirish", callback_data=f"review_{code}")])
     rows.append([InlineKeyboardButton("📤 Challenge yuborish", callback_data=f"chal_{code}")])
     return InlineKeyboardMarkup(rows)
 
@@ -1534,10 +1504,14 @@ _CASUAL_PHRASES = {
 
 
 def looks_like_casual_text(text: str) -> bool:
-    """Salomlashish, minnatdorchilik, emoji va hokazo -- kino qidiruvi EMAS deb topadi."""
+    """Salomlashish, minnatdorchilik, emoji va hokazo -- kino qidiruvi EMAS deb topadi.
+    Raqamli matn (kino kodi bo'lishi mumkin, 1-2 xonali bo'lsa ham) HECH QACHON bu yerda
+    "tushunarsiz" deb topilmaydi."""
     t = text.strip().lower()
     if not t:
         return True
+    if t.isdigit():
+        return False
     if not re.search(r"[a-zA-Zа-яА-ЯёЁ0-9\u0400-\u04FF]", t):
         return True  # faqat emoji/tinish belgilari
     if t in _CASUAL_PHRASES:
@@ -1589,6 +1563,7 @@ async def process_movie_code(message, context: ContextTypes.DEFAULT_TYPE, code: 
     episodes = get_movies_by_code(code)
     if not episodes:
         await message.reply_text("❌ Bunday kodli kino topilmadi. Kodni tekshirib qayta yuboring.")
+        await notify_admins_movie_not_found(context, user_id, code)
         return
 
     if len(episodes) > 1:
@@ -1637,20 +1612,6 @@ async def send_movie_episode(message, context: ContextTypes.DEFAULT_TYPE, movie,
     else:
         await context.bot.send_document(message.chat_id, movie["file_id"], caption=caption,
                                          reply_markup=kb, protect_content=protect)
-
-    # ---- Bugun 3 ta kino ko'rilgan bo'lsa, lekin missiya hali tugallanmagan bo'lsa
-    #      (ya'ni ular haqida hali fikr qoldirilmagan bo'lsa) — eslatma yuboramiz ----
-    today = _today_str()
-    if not _is_mission_completed(user_id, "watch3", today) and len(watched_movies_today(user_id, today)) == 3:
-        try:
-            await context.bot.send_message(
-                user_id,
-                "🎯 Bugun 3 ta kino ko'rdingiz!\n"
-                "Missiyani yakunlash uchun har biri haqida fikringizni yozib qoldiring "
-                "(kino ostidagi \"✍️ Fikr qoldirish\" tugmasi orqali)."
-            )
-        except TelegramError:
-            pass
 
 
 # ============================== AVTOMATIK KANAL/GURUH ANIQLASH ==============================
@@ -1713,11 +1674,21 @@ async def join_request_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
 # ============================== CALLBACK QUERY ROUTER ==============================
 
+async def safe_answer(query, *args, **kwargs):
+    """CallbackQuery.answer() Telegram tomonidan FAQAT BIR MARTA chaqirilishi mumkin —
+    bir xil tugma bosilishiga ikkinchi marta javob berishga urinish xatolik chiqaradi
+    va shu sababli tugma "ishlamay qolgandek" ko'rinadi. Bu funksiya shu xatoni xavfsiz yutadi."""
+    try:
+        await query.answer(*args, **kwargs)
+    except TelegramError:
+        pass
+
+
 async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     data = query.data
     user = query.from_user
-    await query.answer()
+    await safe_answer(query)
 
     # ---------- Umumiy ----------
     if data == "back_start":
@@ -1733,17 +1704,17 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "no_movie_channel":
-        await query.answer("Hali kino kanali ulanmagan.", show_alert=True)
+        await safe_answer(query, "Hali kino kanali ulanmagan.", show_alert=True)
         return
 
     if data == "random_movie":
         movie = get_random_movie()
         if not movie:
-            await query.answer("😔 Hozircha botda kino yo'q.", show_alert=True)
+            await safe_answer(query, "😔 Hozircha botda kino yo'q.", show_alert=True)
             return
         not_subs = await check_subscription(context, user.id)
         if not_subs:
-            await query.answer("⚠️ Avval majburiy kanal/guruhlarga obuna bo'ling.", show_alert=True)
+            await safe_answer(query, "⚠️ Avval majburiy kanal/guruhlarga obuna bo'ling.", show_alert=True)
             return
         await grant_referral_bonus_if_needed(context, get_user(user.id))
         await send_movie_episode(query.message, context, movie, user.id)
@@ -1751,7 +1722,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "mystery_box":
         if not can_open_mystery_box(user.id):
-            await query.answer("📦 Siz bugun sirli qutini allaqachon ochingiz. Ertaga qayta urinib ko'ring!",
+            await safe_answer(query, "📦 Siz bugun sirli qutini allaqachon ochingiz. Ertaga qayta urinib ko'ring!",
                                 show_alert=True)
             return
         reward = open_mystery_box(user.id)
@@ -1796,7 +1767,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "favorites_list":
         items = get_user_favorites(user.id)
         if not items:
-            await query.answer("💔 Sevimlilar ro'yxati bo'sh.", show_alert=True)
+            await safe_answer(query, "💔 Sevimlilar ro'yxati bo'sh.", show_alert=True)
             return
         rows = [
             [InlineKeyboardButton(f"🎬 {r['title'] or r['code']}", callback_data=f"wlpick_{r['code']}")]
@@ -1809,7 +1780,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "history_list":
         items = get_user_history(user.id, 15)
         if not items:
-            await query.answer("🕘 Tarixingiz hozircha bo'sh.", show_alert=True)
+            await safe_answer(query, "🕘 Tarixingiz hozircha bo'sh.", show_alert=True)
             return
         lines = ["🕘 Ko'rilgan kinolar tarixi (oxirgi 15 ta):\n"]
         for r in items:
@@ -1847,15 +1818,30 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "check_sub":
         not_subs = await check_subscription(context, user.id)
         if not_subs:
-            await query.answer("❌ Siz hali barcha kanal/guruhlarga obuna bo'lmagansiz yoki "
+            await safe_answer(query, "❌ Siz hali barcha kanal/guruhlarga obuna bo'lmagansiz yoki "
                                 "maxfiy chatlarga so'rov yubormagansiz!", show_alert=True)
             return
         await grant_referral_bonus_if_needed(context, get_user(user.id))
         await query.message.delete()
         pending_code = context.user_data.pop("pending_code", None)
+        pending_search = context.user_data.pop("pending_search", None)
         await send_start_message(query, context, user)
         if pending_code:
             await process_movie_code(query.message, context, pending_code, user.id)
+        elif pending_search:
+            code, matched_title = smart_search_title(pending_search)
+            if code:
+                await query.message.reply_text(f"🔎 Topildi: \"{matched_title}\"")
+                await process_movie_code(query.message, context, code, user.id)
+            else:
+                context.user_data["last_search_query"] = pending_search
+                await notify_admins_movie_not_found(context, user.id, pending_search)
+                await query.message.reply_text(
+                    "❌ Bunday nomli kino topilmadi.\n\n🔎 Boshqa nom bilan urinib ko'ring.",
+                    reply_markup=InlineKeyboardMarkup(
+                        [[InlineKeyboardButton("🔔 Qo'shilganda xabar berish", callback_data="radar_add")]]
+                    ),
+                )
         return
 
     # ---------- Pul ishlash ----------
@@ -1906,7 +1892,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         label = "Telegram premium" if ptype == "premium" else "Telegram stars"
 
         if u["balance"] < price:
-            await query.answer("❌ Hisobingizda mablag' yetarli emas", show_alert=True)
+            await safe_answer(query, "❌ Hisobingizda mablag' yetarli emas", show_alert=True)
             return
 
         change_balance(user.id, -price)
@@ -1938,7 +1924,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         req_id = int(data.split("_", 1)[1])
         req = get_payment_request(req_id)
         if not req or req["status"] != "pending":
-            await query.answer("Bu so'rov allaqachon ko'rib chiqilgan.", show_alert=True)
+            await safe_answer(query, "Bu so'rov allaqachon ko'rib chiqilgan.", show_alert=True)
             return
         set_payment_status(req_id, "confirmed")
         label = "Telegram premium" if req["ptype"] == "premium" else "Telegram stars"
@@ -1959,16 +1945,16 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ---------- Kino qismlari ----------
     if data.startswith("ep_"):
-        code, ep = data[len("ep_"):].rsplit("_", 1)
+        _, code, ep = data.split("_", 2)
         movie = get_movie_episode(code, int(ep))
         if movie:
             await send_movie_episode(query.message, context, movie, user.id)
         else:
-            await query.answer("Topilmadi", show_alert=True)
+            await safe_answer(query, "Topilmadi", show_alert=True)
         return
 
     if data.startswith("eppage_"):
-        code, page = data[len("eppage_"):].rsplit("_", 1)
+        _, code, page = data.split("_", 2)
         episodes = list(get_movies_by_code(code))
         await query.message.edit_reply_markup(reply_markup=kb_episodes(code, episodes, int(page)))
         return
@@ -1978,10 +1964,10 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         code = data.split("_", 1)[1]
         if is_in_watch_later(user.id, code):
             remove_watch_later(user.id, code)
-            await query.answer("❌ Ro'yxatdan olib tashlandi.")
+            await safe_answer(query, "❌ Ro'yxatdan olib tashlandi.")
         else:
             add_watch_later(user.id, code)
-            await query.answer("🔖 'Keyin ko'raman' ro'yxatiga qo'shildi!")
+            await safe_answer(query, "🔖 'Keyin ko'raman' ro'yxatiga qo'shildi!")
         try:
             await query.message.edit_reply_markup(reply_markup=kb_movie_card(code, user.id))
         except TelegramError:
@@ -1991,7 +1977,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "watch_later_list":
         items = get_watch_later(user.id)
         if not items:
-            await query.answer("📭 Ro'yxatingiz hozircha bo'sh.", show_alert=True)
+            await safe_answer(query, "📭 Ro'yxatingiz hozircha bo'sh.", show_alert=True)
             return
         rows = [
             [InlineKeyboardButton(f"🎬 {r['title'] or r['code']}", callback_data=f"wlpick_{r['code']}")]
@@ -2010,7 +1996,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "radar_add":
         query_text = context.user_data.pop("last_search_query", None)
         if not query_text:
-            await query.answer("⚠️ Amal muddati tugagan, qaytadan qidiring.", show_alert=True)
+            await safe_answer(query, "⚠️ Amal muddati tugagan, qaytadan qidiring.", show_alert=True)
             return
         add_radar_request(user.id, query_text)
         await query.message.edit_text(
@@ -2022,7 +2008,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("fav_"):
         code = data.split("_", 1)[1]
         added = toggle_favorite(user.id, code)
-        await query.answer("❤️ Sevimlilarga qo'shildi!" if added else "💔 Sevimlilardan olib tashlandi.")
+        await safe_answer(query, "❤️ Sevimlilarga qo'shildi!" if added else "💔 Sevimlilardan olib tashlandi.")
         try:
             await query.message.edit_reply_markup(reply_markup=kb_movie_card(code, user.id))
         except TelegramError:
@@ -2031,9 +2017,9 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ---------- Baholash ----------
     if data.startswith("ratepick_"):
-        code, stars = data[len("ratepick_"):].rsplit("_", 1)
+        _, code, stars = data.split("_", 2)
         rate_movie(user.id, code, int(stars))
-        await query.answer(f"✅ Siz {stars} ⭐ baho berdingiz. Rahmat!", show_alert=True)
+        await safe_answer(query, f"✅ Siz {stars} ⭐ baho berdingiz. Rahmat!", show_alert=True)
         return
 
     if data.startswith("rate_"):
@@ -2041,21 +2027,10 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("🌟 Kinoga baho bering:", reply_markup=kb_rating(code))
         return
 
-    # ---------- Fikr (izoh) qoldirish ----------
-    if data.startswith("review_"):
-        code = data[len("review_"):]
-        context.user_data["state"] = "await_review"
-        context.user_data["review_code"] = code
-        await query.answer()
-        await query.message.reply_text(
-            "✍️ Shu kino haqida fikringizni (kamida bir necha so'z) yozib yuboring:"
-        )
-        return
-
     # ---------- Kino statistikasi ----------
     if data.startswith("mstat_"):
         code = data.split("_", 1)[1]
-        await query.answer()
+        await safe_answer(query)
         await query.message.reply_text(f"📊 Statistika:\n\n{movie_stats_text(code)}")
         return
 
@@ -2068,7 +2043,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"https://t.me/share/url?url=https://t.me/{BOT_USERNAME}?start=ref{user.id}_{code}"
             f"&text={share_text}"
         )
-        await query.answer()
+        await safe_answer(query)
         await query.message.reply_text(
             "📤 Do'stlaringizga ulashing:",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("↗️ Ulashish", url=share_url)]]),
@@ -2078,9 +2053,9 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ---------- Quyidagilar faqat adminlar uchun ----------
     if data.startswith(("admin_panel", "padd_", "uptype_", "upmode_", "chdel_", "admdel_",
                          "balchg_", "codeconf_", "movdel_", "movdelall_", "series_more_",
-                         "medit_", "mfield_")):
+                         "medit_", "mfield_", "fileoverwrite_")):
         if not is_admin(user.id):
-            await query.answer("⛔️ Sizda ruxsat yo'q.", show_alert=True)
+            await safe_answer(query, "⛔️ Sizda ruxsat yo'q.", show_alert=True)
             return
         await admin_callback_router(query, context, data, user)
         return
@@ -2102,7 +2077,7 @@ async def admin_callback_router(query, context: ContextTypes.DEFAULT_TYPE, data:
         chat_id = int(chat_id_s)
         pending = get_pending_chat(chat_id)
         if not pending:
-            await query.answer("⚠️ Bu so'rov eskirgan yoki allaqachon ishlov berilgan.", show_alert=True)
+            await safe_answer(query, "⚠️ Bu so'rov eskirgan yoki allaqachon ishlov berilgan.", show_alert=True)
             return
 
         if action == "cancel":
@@ -2217,6 +2192,22 @@ async def admin_callback_router(query, context: ContextTypes.DEFAULT_TYPE, data:
         await query.message.edit_text("🏁 Serial yuklash yakunlandi.")
         return
 
+    # ---- Bir xil kod+qism ustidan qayta yozishni tasdiqlash ----
+    if data == "fileoverwrite_yes":
+        pending = context.user_data.pop("pending_file", None)
+        if not pending or "new_movie" not in context.user_data:
+            await safe_answer(query, "⚠️ Sessiya eskirgan, qaytadan yuklang.", show_alert=True)
+            return
+        await query.message.edit_text("♻️ Ustidan yozilmoqda...")
+        await save_movie_file_and_continue(query.message, context, pending["file_id"], pending["file_type"])
+        return
+
+    if data == "fileoverwrite_no":
+        context.user_data.pop("pending_file", None)
+        context.user_data["state"] = "await_movie_file"
+        await query.message.edit_text("❌ Bekor qilindi. Boshqa faylni yuboring yoki /start bilan qayta boshlang.")
+        return
+
     # ---- Kinoni o'chirish ----
     if data.startswith("movdelall_"):
         code = data.split("_", 1)[1]
@@ -2235,7 +2226,7 @@ async def admin_callback_router(query, context: ContextTypes.DEFAULT_TYPE, data:
         movie_id = int(data.split("_", 1)[1])
         movie = get_movie_by_id(movie_id)
         if not movie:
-            await query.answer("❌ Topilmadi", show_alert=True)
+            await safe_answer(query, "❌ Topilmadi", show_alert=True)
             return
         await query.message.edit_text(movie_edit_text(movie), reply_markup=kb_edit_movie(movie))
         return
@@ -2254,7 +2245,7 @@ async def admin_callback_router(query, context: ContextTypes.DEFAULT_TYPE, data:
     if data.startswith("chdel_"):
         ch_id = int(data.split("_", 1)[1])
         delete_channel(ch_id)
-        await query.answer("✅ O'chirildi")
+        await safe_answer(query, "✅ O'chirildi")
         await query.message.edit_text("✅ Ro'yxatdan o'chirildi.")
         return
 
@@ -2262,11 +2253,11 @@ async def admin_callback_router(query, context: ContextTypes.DEFAULT_TYPE, data:
     if data.startswith("admdel_"):
         target_id = int(data.split("_", 1)[1])
         if target_id == SUPER_ADMIN_ID:
-            await query.answer("⛔️ Asosiy adminni o'chirib bo'lmaydi!", show_alert=True)
+            await safe_answer(query, "⛔️ Asosiy adminni o'chirib bo'lmaydi!", show_alert=True)
             return
         with closing(get_conn()) as conn, conn:
             conn.execute("DELETE FROM admins WHERE user_id=?", (target_id,))
-        await query.answer("✅ Admin o'chirildi")
+        await safe_answer(query, "✅ Admin o'chirildi")
         await query.message.edit_text("✅ Admin ro'yxatdan o'chirildi.")
         return
 
@@ -2987,27 +2978,27 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🎥 Endi kino faylini (video yoki hujjat) yuboring:")
         return
 
-    # ---------- Kino haqida fikr (izoh) — kunlik missiya uchun ----------
-    if state == "await_review":
-        code = context.user_data.get("review_code")
-        context.user_data.pop("state", None)
-        context.user_data.pop("review_code", None)
-        if not code:
+    # ---------- Hech qanday holat mos kelmasa: KOD / MAXFIY KOD / SMART SEARCH ----------
+    text_q = text.strip()
+
+    # 0) Raqamli matn — ENG AVVALO kino kodi sifatida tekshiriladi (hech qachon
+    #    "tushunarsiz matn" yoki boshqa tekshiruvlarga chalg'imaydi)
+    if text_q.isdigit():
+        not_subs = await check_subscription(context, user.id)
+        if not_subs:
+            context.user_data["pending_code"] = text_q
+            await update.message.reply_text(
+                "⚠️ Botdan foydalanish uchun quyidagi kanal/guruhlarga obuna bo'ling:",
+                reply_markup=kb_subscription(not_subs),
+            )
             return
-        if len(text) < 3:
-            await update.message.reply_text("❌ Iltimos, kamida bir necha so'zdan iborat fikr yozing.")
-            context.user_data["state"] = "await_review"
-            context.user_data["review_code"] = code
-            return
-        add_review(user.id, code, _today_str(), text)
-        await update.message.reply_text("✅ Fikringiz uchun rahmat!")
-        await check_and_complete_missions(context, user.id)
+        await grant_referral_bonus_if_needed(context, get_user(user.id))
+        await process_movie_code(update.message, context, text_q, user.id)
         return
 
-    # ---------- Hech qanday holat mos kelmasa: SMART SEARCH ----------
-    # 0) Bugungi maxfiy kod (agar admin belgilagan bo'lsa va hali bugun olmagan bo'lsa)
+    # 1) Bugungi maxfiy kod (agar admin belgilagan bo'lsa va hali bugun olmagan bo'lsa)
     secret_today = get_setting("secret_code_today")
-    if secret_today and text.strip().lower() == secret_today.strip().lower():
+    if secret_today and text_q.lower() == secret_today.strip().lower():
         if has_claimed_secret_code_today(user.id):
             await update.message.reply_text("✅ Siz bugungi maxfiy kod bonusini allaqachon oldingiz.")
         else:
@@ -3019,14 +3010,14 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
 
-    # 1) Salomlashish/minnatdorchilik/emoji kabi "tasodifiy" matnlarni kino deb hisoblamaymiz
-    if looks_like_casual_text(text):
+    # 2) Salomlashish/minnatdorchilik/emoji kabi "tasodifiy" matnlarni kino deb hisoblamaymiz
+    if looks_like_casual_text(text_q):
         await update.message.reply_text("Kino kodi yoki kino nomini yuboring.")
         return
 
     not_subs = await check_subscription(context, user.id)
     if not_subs:
-        context.user_data["pending_code"] = text
+        context.user_data["pending_search"] = text_q
         await update.message.reply_text(
             "⚠️ Botdan foydalanish uchun quyidagi kanal/guruhlarga obuna bo'ling:",
             reply_markup=kb_subscription(not_subs),
@@ -3034,24 +3025,49 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await grant_referral_bonus_if_needed(context, get_user(user.id))
 
-    if text.isdigit():
-        # 2) Raqam -> kino kodi sifatida qidiriladi
-        await process_movie_code(update.message, context, text, user.id)
+    # 3) Raqam emas -> Smart Search (kino nomi bo'yicha, xato yozilgan bo'lsa ham)
+    code, matched_title = smart_search_title(text_q)
+    if code:
+        await update.message.reply_text(f"🔎 Topildi: \"{matched_title}\"")
+        await process_movie_code(update.message, context, code, user.id)
     else:
-        # 3) Raqam emas -> Smart Search (kino nomi bo'yicha, xato yozilgan bo'lsa ham)
-        code, matched_title = smart_search_title(text)
-        if code:
-            await update.message.reply_text(f"🔎 Topildi: \"{matched_title}\"")
-            await process_movie_code(update.message, context, code, user.id)
-        else:
-            context.user_data["last_search_query"] = text.strip()
-            await update.message.reply_text(
-                "❌ Bunday nomli kino topilmadi.\n\n"
-                "🔎 Boshqa nom bilan urinib ko'ring yoki aniq kino kodini yuboring.",
-                reply_markup=InlineKeyboardMarkup(
-                    [[InlineKeyboardButton("🔔 Qo'shilganda xabar berish", callback_data="radar_add")]]
-                ),
-            )
+        context.user_data["last_search_query"] = text_q
+        await notify_admins_movie_not_found(context, user.id, text_q)
+        await update.message.reply_text(
+            "❌ Bunday nomli kino topilmadi.\n\n"
+            "🔎 Boshqa nom bilan urinib ko'ring yoki aniq kino kodini yuboring.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("🔔 Qo'shilganda xabar berish", callback_data="radar_add")]]
+            ),
+        )
+
+
+async def save_movie_file_and_continue(msg, context: ContextTypes.DEFAULT_TYPE, file_id: str, file_type: str):
+    """Kino faylini bazaga yozadi va davomini so'raydi (promo rasm/video yoki serial davomi)."""
+    nm = context.user_data["new_movie"]
+    mode = nm.get("mode", "full")
+    add_movie(nm["code"], nm["episode"], nm.get("title", ""), nm.get("genre", ""),
+               nm.get("language", ""), nm.get("country", ""), file_id, file_type, mode,
+               nm.get("is_series", 0))
+    await notify_radar_waiters(context, nm.get("title", ""), nm["code"])
+
+    # Serial bo'lsa, kanalga FAQAT 1-qismda xabar yuboriladi (poster/teaser bilan).
+    # Keyingi qismlar (2, 3, 4...) uchun kanalga qayta post qilinmaydi — foydalanuvchi
+    # o'sha bitta kod orqali botdan barcha qismlarni ko'ra oladi.
+    if nm.get("is_series") and nm.get("episode", 1) != 1:
+        context.user_data.pop("state", None)
+        await finish_or_continue_series(msg, context, posted_to_channel=False)
+        return
+
+    movie = get_movie_episode(nm["code"], nm["episode"])
+    context.user_data["last_movie"] = dict(movie)
+
+    if mode == "full":
+        context.user_data["state"] = "await_promo_photo"
+        await msg.reply_text("✅ Kino saqlandi!\n\n🖼 Endi kinoning poster rasmini yuboring (kanalga joylash uchun):")
+    else:
+        context.user_data["state"] = "await_promo_video"
+        await msg.reply_text("✅ Kino saqlandi!\n\n🎞 Endi qisqa video (teaser)ni yuboring (kanalga joylash uchun):")
 
 
 async def finish_or_continue_series(msg, context: ContextTypes.DEFAULT_TYPE, posted_to_channel: bool = True):
@@ -3092,29 +3108,26 @@ async def media_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file_id = msg.video.file_id if msg.video else msg.document.file_id
         file_type = "video" if msg.video else "document"
         nm = context.user_data["new_movie"]
-        mode = nm.get("mode", "full")
-        add_movie(nm["code"], nm["episode"], nm.get("title", ""), nm.get("genre", ""),
-                   nm.get("language", ""), nm.get("country", ""), file_id, file_type, mode,
-                   nm.get("is_series", 0))
-        await notify_radar_waiters(context, nm.get("title", ""), nm["code"])
 
-        # Serial bo'lsa, kanalga FAQAT 1-qismda xabar yuboriladi (poster/teaser bilan).
-        # Keyingi qismlar (2, 3, 4...) uchun kanalga qayta post qilinmaydi — foydalanuvchi
-        # o'sha bitta kod orqali botdan barcha qismlarni ko'ra oladi.
-        if nm.get("is_series") and nm.get("episode", 1) != 1:
+        existing = get_movie_episode(nm["code"], nm["episode"])
+        if existing:
+            # Bir xil kino/qism 2-marta (tasodifan) qayta yuklanmasligi uchun bloklaymiz —
+            # faqat admin ataylab tasdiqlasa, ustidan yoziladi.
+            context.user_data["pending_file"] = {"file_id": file_id, "file_type": file_type}
             context.user_data.pop("state", None)
-            await finish_or_continue_series(msg, context, posted_to_channel=False)
+            await msg.reply_text(
+                f"⚠️ \"{nm['code']}\" kodining {nm['episode']}-qismi ALLAQACHON yuklangan!\n\n"
+                "Bitta kino/qism ikki marta yuklanmasligi uchun bloklandi. Mavjudini "
+                "o'zgartirish uchun \"✏️ Tahrirlash\" bo'limidan foydalaning, yoki agar "
+                "ataylab ustidan qayta yozmoqchi bo'lsangiz tasdiqlang:",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("♻️ Ha, ustidan yozilsin", callback_data="fileoverwrite_yes")],
+                    [InlineKeyboardButton("❌ Yo'q, bekor qilish", callback_data="fileoverwrite_no")],
+                ]),
+            )
             return
 
-        movie = get_movie_episode(nm["code"], nm["episode"])
-        context.user_data["last_movie"] = dict(movie)
-
-        if mode == "full":
-            context.user_data["state"] = "await_promo_photo"
-            await msg.reply_text("✅ Kino saqlandi!\n\n🖼 Endi kinoning poster rasmini yuboring (kanalga joylash uchun):")
-        else:
-            context.user_data["state"] = "await_promo_video"
-            await msg.reply_text("✅ Kino saqlandi!\n\n🎞 Endi qisqa video (teaser)ni yuboring (kanalga joylash uchun):")
+        await save_movie_file_and_continue(msg, context, file_id, file_type)
         return
 
     # ---------- Promo rasm ----------
